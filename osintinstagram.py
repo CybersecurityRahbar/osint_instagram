@@ -81,46 +81,140 @@ class TelegramSender:
             try:
                 r = _http_session.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4096], "parse_mode": "Markdown"},
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": text[:4096],
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": "true",
+                    },
                     timeout=15)
-                if r.status_code == 200: return True
+                if r.status_code == 200:
+                    return True
+                if i < retries:
+                    time.sleep(2)
             except Exception as e:
-                if i < retries: time.sleep(2)
-                else: print(f"⚠️ تليجرام: {e}")
+                if i < retries:
+                    time.sleep(2)
+                else:
+                    print(f"⚠️ تليجرام: {e}")
         return False
 
     @staticmethod
-    def send_photo(photo_path, caption=""):
+    def send_rich_message(html_text, reply_markup=None, retries=2):
+        """إرسال Telegram Rich Message (Bot API 10.1+ / 10.3)."""
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "rich_message": json.dumps({
+                "html": html_text[:32768],
+                "is_rtl": True
+            }, ensure_ascii=False),
+            "disable_notification": False,
+        }
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+
+        for i in range(retries + 1):
+            try:
+                r = _http_session.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendRichMessage",
+                    data=payload, timeout=20)
+                if r.status_code == 200:
+                    return True
+                # fallback handled below after retries
+                if i < retries:
+                    time.sleep(1.5)
+            except Exception as e:
+                if i < retries:
+                    time.sleep(1.5)
+                else:
+                    print(f"⚠️ Rich Message: {e}")
+
+        # توافق خلفي: لا نفقد الرسالة إذا لم يكن sendRichMessage متاحاً.
         try:
-            with open(photo_path, "rb") as f:
-                _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
-                    files={"photo": f}, timeout=30)
+            r = _http_session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": TelegramSender._strip_rich_html(html_text)[:4096],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "false",
+                },
+                timeout=15)
+            return r.status_code == 200
         except Exception as e:
-            print(f"⚠️ صورة: {e}")
+            print(f"⚠️ Rich fallback: {e}")
+            return False
 
     @staticmethod
-    def send_video(video_path, caption=""):
+    def _strip_rich_html(html_text):
+        """Fallback نصي بسيط عند عدم دعم Rich Messages."""
+        text_value = re.sub(r"<blockquote[^>]*>", "", html_text, flags=re.I)
+        text_value = re.sub(r"</blockquote>", "", text_value, flags=re.I)
+        text_value = re.sub(r"<details[^>]*>", "", text_value, flags=re.I)
+        text_value = re.sub(r"</details>", "", text_value, flags=re.I)
+        text_value = re.sub(r"<[^>]+>", "", text_value)
+        return text_value.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", '"')
+
+    @staticmethod
+    def _post_keyboard(url, profile_url=None):
+        rows = [[{"text": "🔗 فتح المنشور", "url": url}]]
+        if profile_url:
+            rows.append([{"text": "👤 فتح الحساب", "url": profile_url}])
+        return {"inline_keyboard": rows}
+
+    @staticmethod
+    def send_photo(photo_path, caption="", reply_markup=None):
+        try:
+            with open(photo_path, "rb") as f:
+                r = _http_session.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": caption[:1024],
+                        "parse_mode": "HTML",
+                        "show_caption_above_media": "true",
+                    },
+                    files={"photo": f}, timeout=30)
+                return r.status_code == 200
+        except Exception as e:
+            print(f"⚠️ صورة: {e}")
+            return False
+
+    @staticmethod
+    def send_video(video_path, caption="", reply_markup=None):
         try:
             with open(video_path, "rb") as f:
-                _http_session.post(
+                r = _http_session.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
-                    files={"video": f}, timeout=60)
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": caption[:1024],
+                        "parse_mode": "HTML",
+                        "show_caption_above_media": "true",
+                        "supports_streaming": "true",
+                    },
+                    files={"video": f}, timeout=90)
+                return r.status_code == 200
         except Exception as e:
             print(f"⚠️ فيديو: {e}")
+            return False
 
     @staticmethod
     def send_document(file_path, caption=""):
         try:
             with open(file_path, "rb") as f:
-                _http_session.post(
+                r = _http_session.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": caption[:1024],
+                        "parse_mode": "HTML",
+                    },
                     files={"document": f}, timeout=60)
+                return r.status_code == 200
         except Exception as e:
             print(f"⚠️ ملف: {e}")
+            return False
 
 # ============================================================
 # 4. المسارات
@@ -384,24 +478,41 @@ def save_or_update_account(info):
          int(info['is_verified']), datetime.now().isoformat()))
     conn.commit(); conn.close()
 
-def save_post_if_not_exists(account_username, media, media_type, file_path=None):
+def save_post_if_not_exists(account_username, media, media_type=None, file_path=None):
+    """إنشاء المنشور أو إعادة ID الموجود حتى يمكن استكمال تنزيل سابق فشل."""
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT id FROM accounts WHERE username=?", (account_username,))
     row = c.fetchone()
-    if not row: conn.close(); return None
+    if not row:
+        conn.close()
+        return None
     account_id = row[0]
+
     c.execute("SELECT id FROM posts WHERE post_code=?", (media.code,))
-    if c.fetchone(): conn.close(); return None
-    
+    existing = c.fetchone()
+    if existing:
+        post_id = existing[0]
+        if media_type or file_path:
+            c.execute(
+                "UPDATE posts SET media_type=COALESCE(?, media_type), "
+                "file_path=COALESCE(?, file_path), "
+                "downloaded=CASE WHEN ? IS NOT NULL THEN 1 ELSE downloaded END "
+                "WHERE id=?",
+                (media_type, file_path, file_path, post_id)
+            )
+            conn.commit()
+        conn.close()
+        return post_id
+
     thumb_url = str(getattr(media, 'thumbnail_url', '') or '')
-    
     c.execute('''INSERT INTO posts (account_id, post_code, post_url, media_type,
         caption, like_count, comment_count, taken_at, file_path, downloaded, thumbnail_url)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
         (account_id, media.code, f"https://www.instagram.com/p/{media.code}/",
          media_type, media.caption_text or "", media.like_count, media.comment_count,
          media.taken_at.isoformat(), file_path, 1 if file_path else 0, thumb_url))
-    post_id = c.lastrowid; conn.commit(); conn.close()
+    post_id = c.lastrowid
+    conn.commit(); conn.close()
     return post_id
 
 def update_post_media_type(post_id, media_type, file_path, thumbnail_url=""):
