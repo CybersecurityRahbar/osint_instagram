@@ -47,6 +47,7 @@ import os, json, io, time, random, requests, threading, sqlite3, traceback, csv,
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from html import escape as html_escape
 from flask import Flask, request, render_template_string
 from pyngrok import ngrok
 import instagrapi
@@ -1931,140 +1932,310 @@ class InstagramSearcher:
         except Exception: pass
         return None
 
-    def _download_media(self, folder, url, filename, thumb_url=None):
-        try:
-            fp = os.path.join(folder, filename)
-            is_video = filename.lower().endswith(('.mp4', '.mov'))
-            r = _http_session.get(url, timeout=60 if is_video else 20, stream=True)
-            if r.status_code != 200: return None
-            with open(fp, "wb") as f:
-                for chunk in r.iter_content(8192): f.write(chunk)
-            
-            # 🎨 تحميل thumbnail محلياً (مرة واحدة!)
-            if is_video and thumb_url:
-                ThumbnailEngine.from_url_to_file(thumb_url, fp)
-            elif not is_video:
-                # للصورة، ننشئ thumbnail محلياً من الصورة نفسها
-                ThumbnailEngine.from_file(fp)
-            
-            return fp
-        except Exception as e:
-            print(f"⚠️ تحميل {filename}: {e}")
-        return None
+    def _native_download_media(self, media, folder):
+        """
+        تنزيل الوسائط عبر downloader الرسمي في instagrapi، مع fallback واحد
+        يعتمد على *_download_by_url بدلاً من requests الخام لتجنب TooManyRedirects.
+        """
+        os.makedirs(folder, exist_ok=True)
+        downloaded = []
 
-    def _process_media(self, media, username, folder, fetch_comments=False, max_comments=20):
+        def add_path(path, kind=None):
+            if not path:
+                return
+            p = os.fspath(path)
+            if os.path.exists(p):
+                inferred = kind or ('video' if p.lower().endswith(('.mp4', '.mov', '.webm')) else 'image')
+                downloaded.append((p, inferred))
+
+        try:
+            media_type = int(getattr(media, 'media_type', 0) or 0)
+            pk = str(getattr(media, 'pk', '') or '')
+
+            if media_type == 1:
+                if hasattr(self.client, 'photo_download'):
+                    add_path(self.client.photo_download(pk, folder=folder, overwrite=True), 'image')
+                elif getattr(media, 'thumbnail_url', None) and hasattr(self.client, 'photo_download_by_url'):
+                    add_path(
+                        self.client.photo_download_by_url(
+                            str(media.thumbnail_url), f"image_{getattr(media, 'code', pk)}.jpg",
+                            folder=folder, overwrite=True
+                        ), 'image'
+                    )
+
+            elif media_type == 2:
+                if hasattr(self.client, 'video_download'):
+                    add_path(self.client.video_download(pk, folder=folder, overwrite=True), 'video')
+                elif getattr(media, 'video_url', None) and hasattr(self.client, 'video_download_by_url'):
+                    add_path(
+                        self.client.video_download_by_url(
+                            str(media.video_url), f"video_{getattr(media, 'code', pk)}.mp4",
+                            folder=folder, overwrite=True
+                        ), 'video'
+                    )
+
+            elif media_type == 8:
+                if hasattr(self.client, 'album_download'):
+                    result = self.client.album_download(pk, folder=folder, overwrite=True)
+                    if isinstance(result, (list, tuple)):
+                        for p in result:
+                            add_path(p)
+                    else:
+                        add_path(result)
+                else:
+                    # Fallback: احصل على موارد الكاروسيل مرة واحدة فقط.
+                    mi = self.client.media_info(pk)
+                    for idx, resource in enumerate(getattr(mi, 'resources', []) or [], 1):
+                        rpk = str(getattr(resource, 'pk', '') or '')
+                        if int(getattr(resource, 'media_type', 0) or 0) == 2 and hasattr(self.client, 'video_download'):
+                            add_path(
+                                self.client.video_download(rpk, folder=folder, overwrite=True),
+                                'video'
+                            )
+                        elif hasattr(self.client, 'photo_download'):
+                            add_path(
+                                self.client.photo_download(rpk, folder=folder, overwrite=True),
+                                'image'
+                            )
+
+            if downloaded:
+                return downloaded
+
+        except Exception as e:
+            if InstagramClient._is_rate_limit_error(e):
+                InstagramClient._mark_throttle(e)
+                raise
+            print(f"      ⚠️ downloader الأصلي: {type(e).__name__}: {str(e)[:140]}")
+
+        # Fallback واحد فقط بواسطة URL الرسمي الذي يحتويه media.
+        try:
+            code = str(getattr(media, 'code', getattr(media, 'pk', 'media')))
+            media_type = int(getattr(media, 'media_type', 0) or 0)
+
+            if media_type == 1 and getattr(media, 'thumbnail_url', None) and hasattr(self.client, 'photo_download_by_url'):
+                add_path(
+                    self.client.photo_download_by_url(
+                        str(media.thumbnail_url), f"image_{code}.jpg",
+                        folder=folder, overwrite=True
+                    ), 'image'
+                )
+            elif media_type == 2 and getattr(media, 'video_url', None) and hasattr(self.client, 'video_download_by_url'):
+                add_path(
+                    self.client.video_download_by_url(
+                        str(media.video_url), f"video_{code}.mp4",
+                        folder=folder, overwrite=True
+                    ), 'video'
+                )
+
+        except Exception as e:
+            if InstagramClient._is_rate_limit_error(e):
+                InstagramClient._mark_throttle(e)
+                raise
+            print(f"      ⚠️ fallback downloader: {type(e).__name__}: {str(e)[:140]}")
+
+        return downloaded
+
+    def _post_caption_html(self, media, index, total, username):
+        code = html_escape(str(getattr(media, 'code', '') or ''))
+        url = f"https://www.instagram.com/p/{code}/"
+        date = getattr(media, 'taken_at', None)
+        date_text = date.strftime("%Y-%m-%d %H:%M") if date else "غير معروف"
+        caption = str(getattr(media, 'caption_text', '') or "(لا يوجد نص)")
+        caption = html_escape(caption[:600])
+        likes = int(getattr(media, 'like_count', 0) or 0)
+        comments = int(getattr(media, 'comment_count', 0) or 0)
+        profile_url = f"https://www.instagram.com/{html_escape(username)}/"
+
+        return (
+            f"<b>📌 المنشور #{index:02d} / {total:02d}</b>  •  <code>{code}</code>\n"
+            f"👤 <a href=\"{profile_url}\">@{html_escape(username)}</a>\n"
+            f"📅 {date_text}\n"
+            f"❤️ {likes:,}   💬 {comments:,}\n"
+            f"\n<blockquote>{caption}</blockquote>\n"
+            f'<a href="{url}">🔗 فتح المنشور على Instagram</a>'
+        )
+
+    def _process_media(self, media, username, folder, index=1, total=1,
+                       fetch_comments=False, max_comments=20):
         try:
             pid = save_post_if_not_exists(username, media, None)
-            if pid is None: return False
+            if pid is None:
+                print(f"      ⚠️ لا يوجد حساب محفوظ لـ @{username}")
+                return False
 
-            cap = media.caption_text or "(لا يوجد نص)"
-            url = f"https://www.instagram.com/p/{media.code}/"
-            date = media.taken_at.strftime("%Y-%m-%d %H:%M")
-            cap_clean = cap[:900].replace('_', '\\_').replace('*', '\\*')
-            TelegramSender.send_message(
-                f"📸 *منشور*\n🔗 {url}\n📅 {date}\n"
-                f"❤️ {media.like_count:,}\n💬 {media.comment_count:,}\n\n📝 {cap_clean}")
+            files = self._native_download_media(media, folder)
 
-            mtype, main_fp, tasks = None, None, []
+            if not files:
+                # لا نعتبر المنشور منجزاً إذا لم تُحفظ وسائطه.
+                TelegramSender.send_rich_message(
+                    self._post_caption_html(media, index, total, username) +
+                    "\n\n⚠️ <b>تعذر تنزيل الوسائط الآن</b> — تم الاحتفاظ بالمنشور في قاعدة البيانات لإعادة المحاولة."
+                )
+                print(f"      ⚠️ لم يتم تنزيل الوسائط للمنشور {getattr(media, 'code', '?')}")
+                return False
+
+            main_fp = files[0][0]
+            mtype = files[0][1] if len(files) == 1 else 'carousel'
             thumb_url = str(getattr(media, 'thumbnail_url', '') or '')
-            
-            if media.media_type == 2:
-                mtype = 'video'
-                low = self._get_low_res_video_url(media)
-                vurl = low if low else media.video_url
-                if vurl:
-                    tasks.append((folder, str(vurl), f"video_{media.code}.mp4", thumb_url))
-            elif media.media_type == 1:
-                mtype = 'image'
-                if media.thumbnail_url:
-                    tasks.append((folder, str(media.thumbnail_url), f"image_{media.code}.jpg", None))
-            elif media.media_type == 8:
-                mtype = 'carousel'
-                mi = self.client.media_info(media.pk)
-                if hasattr(mi, 'resources') and mi.resources:
-                    for i, r in enumerate(mi.resources, 1):
-                        if r.media_type == 2 and r.video_url:
-                            low = self._get_low_res_video_url(r)
-                            vurl = low if low else r.video_url
-                            tasks.append((folder, str(vurl), f"video_{media.code}_{i}.mp4",
-                                          str(getattr(r, 'thumbnail_url', '')) or None))
-                        elif r.thumbnail_url:
-                            tasks.append((folder, str(r.thumbnail_url), f"image_{media.code}_{i}.jpg", None))
 
-            if tasks:
-                with ThreadPoolExecutor(max_workers=min(len(tasks), 4)) as ex:
-                    futs = {ex.submit(self._download_media, *t): t for t in tasks}
-                    for fu in as_completed(futs):
-                        res = fu.result()
-                        if res:
-                            t = futs[fu]
-                            is_vid = t[2].lower().endswith(('.mp4', '.mov'))
-                            (TelegramSender.send_video if is_vid else TelegramSender.send_photo)(
-                                res, f"{'🎥' if is_vid else '🖼️'} {t[2]}")
-                            if main_fp is None: main_fp = res
+            update_post_media_type(pid, mtype, main_fp, thumb_url)
 
-            if mtype: update_post_media_type(pid, mtype, main_fp, thumb_url)
+            keyboard = TelegramSender._post_keyboard(
+                f"https://www.instagram.com/p/{html_escape(str(getattr(media, 'code', '')))}" + "/",
+                f"https://www.instagram.com/{html_escape(username)}/"
+            )
 
-            if fetch_comments and media.comment_count > 0:
+            caption = self._post_caption_html(media, index, total, username)
+            for file_index, (path, kind) in enumerate(files, 1):
+                media_caption = caption
+                if file_index > 1:
+                    media_caption = (
+                        f"<b>📌 المنشور #{index:02d} / {total:02d}</b>  •  "
+                        f"🖼️ ملف {file_index}/{len(files)}\n"
+                        f'<a href="https://www.instagram.com/p/{html_escape(str(getattr(media, "code", "")))}">🔗 فتح المنشور</a>'
+                    )
+                if kind == 'video':
+                    ok = TelegramSender.send_video(path, media_caption, reply_markup=keyboard if file_index == 1 else None)
+                else:
+                    ok = TelegramSender.send_photo(path, media_caption, reply_markup=keyboard if file_index == 1 else None)
+                if not ok:
+                    print(f"      ⚠️ تعذر إرسال {os.path.basename(path)} إلى Telegram")
+                InstagramClient.human_delay(0.5, 1.2)
+
+            if fetch_comments and int(getattr(media, 'comment_count', 0) or 0) > 0:
                 try:
                     comments = self.client.media_comments(media.pk, amount=max_comments)
-                    for c in comments: save_comment(pid, c)
-                except Exception as ce: print(f"   ⚠️ تعليقات: {ce}")
+                    for c in comments:
+                        save_comment(pid, c)
+                except Exception as ce:
+                    if InstagramClient._is_rate_limit_error(ce):
+                        InstagramClient._mark_throttle(ce)
+                    print(f"   ⚠️ تعليقات: {type(ce).__name__}: {str(ce)[:100]}")
 
             InstagramClient._save_session()
-            InstagramClient.human_delay(2, 5)
             return True
+
         except Exception as e:
-            print(f"⚠️ معالجة: {type(e).__name__}")
-            InstagramClient.human_delay(4, 8)
+            if InstagramClient._is_rate_limit_error(e):
+                InstagramClient._mark_throttle(e)
+                print("🛑 تم إيقاف المعالجة مؤقتاً بسبب 429. الجلسة محفوظة ولن يتم تسجيل الخروج.")
+                return False
+            print(f"⚠️ معالجة: {type(e).__name__}: {str(e)[:120]}")
             return False
 
     def get_profile_info(self, username):
         if not InstagramClient.refresh_if_needed():
-            TelegramSender.send_message("❌ الجلسة منقطعة"); return None
+            if InstagramClient.is_throttled():
+                TelegramSender.send_message(
+                    f"🛑 Instagram يفرض تهدئة مؤقتة بسبب كثرة الطلبات. الجلسة محفوظة. "
+                    f"المتبقي تقريباً {InstagramClient.throttle_remaining()} ثانية."
+                )
+            else:
+                TelegramSender.send_message("❌ لا توجد جلسة Instagram صالحة حالياً")
+            return None
+
         print(f"📊 معلومات: {username}")
         try:
-            # 🎯 استخدام Cache الذكي - يمنع 429
-            uid = InstagramClient.get_user_id_cached(self.client, username)
-            if not uid:
-                TelegramSender.send_message(f"❌ لم يتم العثور على @{username}")
-                return None
-            
-            InstagramClient.human_delay()
-            u = self.client.user_info(uid)
-            info = {'username': u.username, 'full_name': u.full_name, 'bio': u.biography,
-                    'posts_count': u.media_count, 'followers': u.follower_count,
-                    'following': u.following_count, 'profile_pic': u.profile_pic_url,
-                    'is_private': u.is_private, 'is_verified': u.is_verified}
+            # اسم مستخدم مباشر: جلب الملف الكامل مباشرة بدون Search endpoint.
+            u = self.client.user_info_by_username(username)
+            uid = str(getattr(u, 'pk', '') or '')
+            if uid:
+                InstagramClient._user_id_cache[str(username).lower().lstrip('@')] = uid
+                InstagramClient._save_user_cache()
+
+            info = {
+                'username': str(getattr(u, 'username', username) or username),
+                'full_name': str(getattr(u, 'full_name', '') or ''),
+                'bio': str(getattr(u, 'biography', '') or ''),
+                'posts_count': int(getattr(u, 'media_count', 0) or 0),
+                'followers': int(getattr(u, 'follower_count', 0) or 0),
+                'following': int(getattr(u, 'following_count', 0) or 0),
+                'profile_pic': str(getattr(u, 'profile_pic_url', '') or ''),
+                'is_private': bool(getattr(u, 'is_private', False)),
+                'is_verified': bool(getattr(u, 'is_verified', False)),
+                'is_business': bool(getattr(u, 'is_business', False) or getattr(u, 'is_professional_account', False)),
+                'category': str(getattr(u, 'category', '') or getattr(u, 'business_category_name', '') or ''),
+                'external_url': str(getattr(u, 'external_url', '') or ''),
+            }
             save_or_update_account(info)
             InstagramClient._save_session()
-            TelegramSender.send_message(
-                f"👤 *{info['username']}*\n📝 {info['full_name']}\n"
-                f"📊 {info['posts_count']:,} منشور\n👥 {info['followers']:,} متابع\n"
-                f"👣 {info['following']:,} يتابع\n"
-                f"🔒 خاص: {'نعم' if info['is_private'] else 'لا'}\n"
-                f"✅ موثق: {'نعم' if info['is_verified'] else 'لا'}\n\n📝 {info['bio'][:200]}")
+
+            uname = html_escape(info['username'])
+            fullname = html_escape(info['full_name'] or "—")
+            bio = html_escape(info['bio'][:700] or "لا يوجد")
+            status = "🔒 خاص" if info['is_private'] else "🌐 عام"
+            verified = "✅ موثق" if info['is_verified'] else "— غير موثق"
+            account_type = "💼 احترافي/تجاري" if info['is_business'] else "👤 شخصي"
+            cat = html_escape(info['category']) if info['category'] else "—"
+            website = info['external_url']
+
+            profile_html = (
+                f"<b>👤 @{uname}</b>\n"
+                f"<b>{fullname}</b>\n\n"
+                f"📊 <b>إحصائيات الحساب</b>\n"
+                f"• المنشورات: <b>{info['posts_count']:,}</b>\n"
+                f"• المتابعون: <b>{info['followers']:,}</b>\n"
+                f"• يتابع: <b>{info['following']:,}</b>\n"
+                f"• الحالة: <b>{status}</b>\n"
+                f"• التوثيق: <b>{verified}</b>\n"
+                f"• النوع: <b>{account_type}</b>\n"
+                f"• الفئة: <b>{cat}</b>\n\n"
+                f"<blockquote expandable>{bio}</blockquote>"
+            )
+            if website:
+                profile_html += f'\n🌐 <a href="{html_escape(website)}">الموقع الخارجي</a>'
+
+            profile_html += (
+                f'\n\n<a href="https://www.instagram.com/{uname}/">🔗 فتح الحساب على Instagram</a>'
+            )
+
+            keyboard = TelegramSender._post_keyboard(
+                f"https://www.instagram.com/{uname}/"
+            )
+
             if info['profile_pic']:
                 try:
-                    r = _http_session.get(str(info['profile_pic']), timeout=10)
+                    r = _http_session.get(info['profile_pic'], timeout=15)
                     if r.status_code == 200:
-                        f = os.path.join(MEDIA_PATH, username); os.makedirs(f, exist_ok=True)
-                        p = os.path.join(f, "profile_pic.jpg")
-                        with open(p, "wb") as fp: fp.write(r.content)
-                        # حفظ thumbnail محلي
-                        ThumbnailEngine.from_file(p)
-                        TelegramSender.send_photo(p, f"🖼️ @{info['username']}")
-                except Exception as e: print(f"⚠️ صورة: {e}")
+                        fpath = os.path.join(MEDIA_PATH, info['username'])
+                        os.makedirs(fpath, exist_ok=True)
+                        p = os.path.join(fpath, "profile_pic.jpg")
+                        with open(p, "wb") as fp:
+                            fp.write(r.content)
+                        TelegramSender.send_photo(
+                            p, profile_html, reply_markup=keyboard
+                        )
+                    else:
+                        TelegramSender.send_rich_message(profile_html, reply_markup=keyboard)
+                except Exception as e:
+                    print(f"⚠️ صورة البروفايل: {type(e).__name__}: {str(e)[:100]}")
+                    TelegramSender.send_rich_message(profile_html, reply_markup=keyboard)
+            else:
+                TelegramSender.send_rich_message(profile_html, reply_markup=keyboard)
+
             return info
         except Exception as e:
-            print(f"❌ {e}"); TelegramSender.send_message(f"❌ {e}"); return None
+            if InstagramClient._is_rate_limit_error(e):
+                InstagramClient._mark_throttle(e)
+                TelegramSender.send_message("🛑 Instagram فرض تهدئة أثناء جلب معلومات الحساب. الجلسة محفوظة.")
+            else:
+                print(f"❌ {type(e).__name__}: {e}")
+                TelegramSender.send_message(f"❌ {type(e).__name__}: {html_escape(str(e)[:300])}")
+            return None
 
     def scrape(self, username, max_posts=10, scrape_mode='smart_merge', order='desc',
                fetch_comments=False, max_comments=20, fetch_followers=False, max_followers=100,
                fetch_stories=False, max_stories=50,
                fetch_highlights=False, max_highlights=20):
         if not InstagramClient.refresh_if_needed():
-            TelegramSender.send_message("❌ الجلسة منقطعة"); return
+            if InstagramClient.is_throttled():
+                TelegramSender.send_message(
+                    f"🛑 Instagram يفرض تهدئة مؤقتة بسبب 429. "
+                    f"الجلسة لم تنتهِ ولن نعيد تسجيل الدخول. المتبقي تقريباً {InstagramClient.throttle_remaining()} ثانية."
+                )
+            else:
+                TelegramSender.send_message("❌ لا توجد جلسة Instagram صالحة حالياً")
+            return
 
         mode_names = {'posts_only': '📸 منشورات فقط',
                       'posts_and_videos': '📸🎬 منشورات+فيديوهات',
@@ -2089,9 +2260,23 @@ class InstagramSearcher:
                     f"📌 *{len(targets)} منشور* — @{username}\n"
                     f"الوضع: {mode_names.get(scrape_mode)}\n"
                     f"الترتيب: {'الأحدث' if order == 'desc' else 'الأقدم'}")
+                successful = 0
                 for i, m in enumerate(targets, 1):
+                    if InstagramClient.is_throttled():
+                        print(f"🛑 توقف آمن بعد 429 — حفظنا ما تم إنجازه ({successful}/{len(targets)})")
+                        TelegramSender.send_message(
+                            f"🛑 توقف آمن بسبب تقييد Instagram بعد {successful}/{len(targets)} منشورات.\n"
+                            f"الجلسة محفوظة، ولن يتم تسجيل الدخول من جديد.\n"
+                            f"⏳ التهدئة الحالية: {InstagramClient.throttle_remaining()} ثانية."
+                        )
+                        break
                     print(f"📄 [{i}/{len(targets)}] {m.code}")
-                    self._process_media(m, username, folder, fetch_comments, max_comments)
+                    if self._process_media(
+                        m, username, folder, index=i, total=len(targets),
+                        fetch_comments=fetch_comments, max_comments=max_comments
+                    ):
+                        successful += 1
+                    InstagramClient.human_delay(1.5, 3.0)
 
             if fetch_followers and account_id:
                 try:
