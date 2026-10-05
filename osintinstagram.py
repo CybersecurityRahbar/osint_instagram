@@ -173,6 +173,7 @@ class TelegramSender:
                         "caption": caption[:1024],
                         "parse_mode": "HTML",
                         "show_caption_above_media": "true",
+                        **({"reply_markup": json.dumps(reply_markup, ensure_ascii=False)} if reply_markup else {}),
                     },
                     files={"photo": f}, timeout=30)
                 return r.status_code == 200
@@ -192,6 +193,7 @@ class TelegramSender:
                         "parse_mode": "HTML",
                         "show_caption_above_media": "true",
                         "supports_streaming": "true",
+                        **({"reply_markup": json.dumps(reply_markup, ensure_ascii=False)} if reply_markup else {}),
                     },
                     files={"video": f}, timeout=90)
                 return r.status_code == 200
@@ -665,6 +667,10 @@ class InstagramClient:
     _last_login_failure_at = 0.0
     _last_login_error = ""
     _last_sessionid_failure_at = 0.0
+    _last_throttle_at = 0.0
+    _THROTTLE_COOLDOWN_SECONDS = 300
+    _SESSION_VALIDATION_INTERVAL_SECONDS = 600
+    _last_session_validation_at = 0.0
     _LOGIN_COOLDOWN_SECONDS = 900
     _SESSIONID_COOLDOWN_SECONDS = 900
     _SESSION_FILE = ("/content/drive/MyDrive/ig_tool_session.json" if IN_COLAB
@@ -695,42 +701,41 @@ class InstagramClient:
     
     @classmethod
     def get_user_id_cached(cls, client, username):
-        """
-        الحصول على user_id بـ 3 استراتيجيات:
-        1. من Cache (الأفضل - بدون طلبات)
-        2. من search_users (سريع - طلب واحد)
-        3. من user_id_from_username (fallback)
-        """
-        username = username.lower().strip()
-        
-        # 1. Cache
+        """حل اسم مستخدم مباشر بدون استدعاء واجهة Search."""
+        username = str(username or "").lower().strip().lstrip("@")
+        if not username:
+            return None
+
         if username in cls._user_id_cache:
             return cls._user_id_cache[username]
-        
-        # 2. search_users (الأفضل - أقل احتمال للحظر)
+
+        # اسم مستخدم مباشر: نستخدم user_info_by_username() أولاً.
         try:
-            users = client.search_users(username, 5)
-            if users:
-                for u in users:
-                    u_name = getattr(u, 'username', '').lower()
-                    u_pk = str(getattr(u, 'pk', ''))
-                    if u_name and u_pk:
-                        cls._user_id_cache[u_name] = u_pk
-                        if u_name == username:
-                            cls._save_user_cache()
-                            return u_pk
+            user = client.user_info_by_username(username)
+            uid = str(getattr(user, "pk", "") or "")
+            actual_username = str(getattr(user, "username", username) or username).lower()
+            if uid:
+                cls._user_id_cache[username] = uid
+                cls._user_id_cache[actual_username] = uid
+                cls._save_user_cache()
+                return uid
         except Exception as e:
-            print(f"      ⚠️ search_users: {type(e).__name__}")
-        
-        # 3. Fallback
+            if cls._is_rate_limit_error(e):
+                cls._mark_throttle(e)
+            print(f"      ⚠️ user_info_by_username: {type(e).__name__}: {str(e)[:100]}")
+
+        # fallback واحد فقط
         try:
             uid = str(client.user_id_from_username(username))
-            cls._user_id_cache[username] = uid
-            cls._save_user_cache()
-            return uid
+            if uid:
+                cls._user_id_cache[username] = uid
+                cls._save_user_cache()
+                return uid
         except Exception as e:
-            print(f"      ⚠️ user_id_from_username: {type(e).__name__}: {str(e)[:80]}")
-            return None
+            if cls._is_rate_limit_error(e):
+                cls._mark_throttle(e)
+            print(f"      ⚠️ user_id_from_username: {type(e).__name__}: {str(e)[:100]}")
+        return None
 
     @staticmethod
     def _get_settings(client):
@@ -753,6 +758,33 @@ class InstagramClient:
         status = getattr(response, "status_code", None)
         message = str(exc).strip() or type(exc).__name__
         return status, message[:500]
+
+    @classmethod
+    def _mark_throttle(cls, exc=None):
+        cls._last_throttle_at = time.time()
+        if exc is not None:
+            status, message = cls._login_error_details(exc)
+            if status or message:
+                cls._last_login_error = f"HTTP {status}: {message}" if status else message
+
+    @classmethod
+    def is_throttled(cls):
+        return bool(cls._last_throttle_at and
+                    (time.time() - cls._last_throttle_at) < cls._THROTTLE_COOLDOWN_SECONDS)
+
+    @classmethod
+    def throttle_remaining(cls):
+        if not cls._last_throttle_at:
+            return 0
+        return max(0, int(cls._THROTTLE_COOLDOWN_SECONDS -
+                          (time.time() - cls._last_throttle_at)))
+
+    @staticmethod
+    def _is_rate_limit_error(exc):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        text_value = str(exc).lower()
+        return status == 429 or "429" in text_value or "too many requests" in text_value
 
     @classmethod
     def _configure_client(cls, client):
@@ -794,6 +826,8 @@ class InstagramClient:
             cls._client = client
             cls._last_login_failure_at = 0.0
             cls._last_login_error = ""
+            cls._last_session_validation_at = time.time()
+            cls._last_throttle_at = 0.0
             cls._save_session(force=True)
             cls._last_sessionid_failure_at = 0.0
             print(f"✅ تم إنشاء جلسة Instagram من {source}")
@@ -962,34 +996,48 @@ class InstagramClient:
     def refresh_if_needed(cls):
         if cls._client is None:
             return False
+
+        # لا نرسل account_info() مع كل مهمة؛ نتحقق دورياً فقط.
+        if cls._last_session_validation_at:
+            age = time.time() - cls._last_session_validation_at
+            if age < cls._SESSION_VALIDATION_INTERVAL_SECONDS:
+                return True
+
+        if cls.is_throttled():
+            print(f"🛑 Instagram في فترة تهدئة بسبب 429 — المتبقي تقريباً {cls.throttle_remaining()}s")
+            return False
+
         try:
-            # instagrapi 3.x removed user_timeline(); account_info() is
-            # the current authenticated-account validation call.
             if not hasattr(cls._client, "account_info"):
                 raise AttributeError("Client 3.x لا يحتوي account_info()")
             cls._client.account_info()
+            cls._last_session_validation_at = time.time()
             return True
         except Exception as e:
-            status, message = cls._login_error_details(e)
-            lower = message.lower()
-            if status == 429 or "429" in lower:
-                print("🛑 429 أثناء التحقق من الجلسة؛ لن نحاول login() تلقائياً الآن.")
-                cls._last_login_failure_at = time.time()
-                cls._last_login_error = f"HTTP {status}: {message}" if status else message
+            lower = str(e).lower()
+            if cls._is_rate_limit_error(e):
+                cls._mark_throttle(e)
+                print("🛑 Instagram أعاد 429 أثناء التحقق من الجلسة.")
+                print("   الجلسة لم تُلغَ ولم نعد تسجيل الدخول؛ تم حفظ حالة التقييد فقط.")
                 return False
+
             if "login_required" in lower or "challenge_required" in lower:
                 try:
                     ok = cls._client.login(IG_USERNAME, IG_PASSWORD)
                     if ok is False:
                         return False
+                    cls._last_session_validation_at = time.time()
                     cls._save_session(force=True)
                     return True
                 except Exception as relogin_exc:
                     status2, message2 = cls._login_error_details(relogin_exc)
+                    if cls._is_rate_limit_error(relogin_exc):
+                        cls._mark_throttle(relogin_exc)
                     cls._last_login_failure_at = time.time()
                     cls._last_login_error = f"HTTP {status2}: {message2}" if status2 else message2
                     return False
-            print(f"⚠️ فشل التحقق من جلسة Instagram: {type(e).__name__}: {message}")
+
+            print(f"⚠️ فشل التحقق من جلسة Instagram: {type(e).__name__}: {str(e)[:180]}")
             return False
 
     @classmethod
