@@ -223,3 +223,30 @@ Do not delete the existing Drive session before testing. First restart/clean the
   - Telegram Rich Message endpoint and caption-above-media support are present.
 - Live Colab validation remains the final test for actual Instagram CDN downloads, media completeness, and Telegram rendering.
 
+## 2026-10-05 — Critical account-security incident and change of direction
+
+### User runtime evidence
+- A browser-derived Session ID was accepted by instagrapi and initially allowed profile/media extraction, including photos, videos, comments and likes.
+- During the same workflow, follower-list retrieval and Story/Highlights retrieval hit Instagram public/GraphQL challenge paths and returned HTML challenge pages instead of JSON.
+- Instagram subsequently returned `ChallengeRequired` with the message:
+  `Manual verification required via Instagram native challenge flow...`
+- The user reports that the Instagram account was logged out on laptop and phone and the account displayed a security warning requesting email/contact-point changes.
+- The user confirms this pattern had happened repeatedly in older versions of the tool when copying a browser session.
+
+### Updated diagnosis
+1. Browser Session ID cloning is not a stable authentication mechanism for this project. The observed logout/security checkpoint is strong evidence that moving a live browser session into Colab is triggering Instagram's account/session integrity checks.
+2. The current `accounts/update_risky_contactpoint` and native challenge responses show an account-security checkpoint, not a normal scraper API error.
+3. The fresh password CAA path independently remains unreliable: instagrapi currently has an open issue for fresh login returning HTTP 429 at `send_login_request` (#2852, opened 2026-10-02), even on current 3.0.20.
+4. Therefore there is no responsible code-only guarantee that can restore the old high-volume password-login workflow against Instagram's current server-side anti-abuse system.
+
+### Safety/architecture decision
+- Stop using browser Session IDs in the tool. The Session ID prompt/bootstrap was disabled.
+- Do not attempt to bypass Native/Bloks challenge flows, rotate identities aggressively, or keep retrying login after 429.
+- The tool now treats `ChallengeRequired` as a hard circuit-breaker and preserves the existing session state instead of attempting further authentication.
+- Continue to preserve completed media locally so interrupted jobs can be resumed without re-downloading successful files.
+- For reliable authorized access to accounts the user controls, investigate Meta's official Instagram Platform API.
+- For arbitrary public OSINT targets, document that Stories/follower lists and other protected surfaces are not guaranteed through the official API; the current unofficial private/web endpoints may trigger account challenges and should not be forced.
+
+### Immediate account-protection action
+- The affected personal Instagram account should be secured through Instagram's official recovery/security UI before any more automation is attempted. Do not reuse the browser Session ID in Colab.
+
