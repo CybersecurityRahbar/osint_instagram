@@ -18,8 +18,27 @@ THUMB_QUALITY = 40
 THUMB_OPTIMIZE = True
 
 # ============================================================
-# 2. الاستيرادات
+# 2. الاستيرادات + توافق الاعتماديات
 # ============================================================
+# النسخة المستهدفة مثبتة هنا داخل الملف نفسه حتى لا يعتمد تشغيل Colab
+# على requirements.txt أو أي ملف خارجي.
+REQUIRED_INSTAGRAPI_VERSION = "3.0.20"
+
+import importlib.metadata as importlib_metadata
+
+try:
+    INSTAGRAPI_VERSION = importlib_metadata.version("instagrapi")
+except importlib_metadata.PackageNotFoundError:
+    INSTAGRAPI_VERSION = None
+
+if INSTAGRAPI_VERSION != REQUIRED_INSTAGRAPI_VERSION:
+    raise RuntimeError(
+        "نسخة instagrapi غير صحيحة. "
+        f"المطلوب: {REQUIRED_INSTAGRAPI_VERSION} | "
+        f"المثبت حالياً: {INSTAGRAPI_VERSION or 'غير مثبت'}. "
+        "ثبّت النسخة المطلوبة في خلية التثبيت المنفصلة ثم أعد تشغيل خلية الأداة."
+    )
+
 import os, json, io, time, random, requests, threading, sqlite3, traceback, csv, re, base64
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
