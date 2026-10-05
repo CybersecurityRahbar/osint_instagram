@@ -752,6 +752,28 @@ class InstagramClient:
                 cls._configure_client(client)
                 session_loaded = True
                 print("♻️ تم تحميل الجلسة المحفوظة مع ترقية ملف app profile")
+
+                # تحقق من الجلسة أولاً. إذا كانت صالحة، لا نرسل login()
+                # ولا كلمة المرور مرة أخرى.
+                try:
+                    if hasattr(client, "account_info"):
+                        client.account_info()
+                        cls._client = client
+                        cls._last_login_failure_at = 0.0
+                        cls._last_login_error = ""
+                        print("✅ الجلسة المحفوظة صالحة — لا حاجة لإعادة تسجيل الدخول")
+                        return cls._client
+                except Exception as session_check_error:
+                    status, message = cls._login_error_details(session_check_error)
+                    lower = message.lower()
+                    if status == 429 or "429" in lower:
+                        cls._last_login_failure_at = time.time()
+                        cls._last_login_error = f"HTTP {status}: {message}" if status else message
+                        print("🛑 الجلسة موجودة لكن Instagram أعاد 429 أثناء التحقق منها.")
+                        print("   لن ننتقل إلى password/CAA تلقائياً.")
+                        return None
+                    if "login_required" not in lower and "challenge_required" not in lower:
+                        print(f"⚠️ تعذر التحقق من الجلسة المحفوظة: {type(session_check_error).__name__}: {str(session_check_error)[:160]}")
             except Exception as e:
                 print(f"⚠️ تعذر تحميل الجلسة المحفوظة: {type(e).__name__}: {str(e)[:160]}")
                 client = cls._configure_client(Client())
@@ -768,8 +790,8 @@ class InstagramClient:
         if not session_loaded:
             print("ℹ️ لا توجد جلسة محفوظة — سيتم تنفيذ محاولة دخول واحدة فقط بكلمة المرور")
 
-        # 3) login() في instagrapi 3.x يتحقق من الجلسة أولاً،
-        #    ثم يستخدم CAA عند الحاجة.
+        # 3) لا نصل إلى login() إلا عندما لا توجد جلسة قابلة للاستخدام
+        #    أو تحتاج الجلسة إلى إعادة مصادقة.
         try:
             cls._configure_client(client)
             ok = client.login(IG_USERNAME, IG_PASSWORD)
