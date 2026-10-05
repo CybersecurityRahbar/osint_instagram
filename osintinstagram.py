@@ -46,13 +46,13 @@ if INSTAGRAPI_VERSION != REQUIRED_INSTAGRAPI_VERSION:
 
 import os, json, io, time, random, requests, threading, sqlite3, traceback, csv, re, base64
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html import escape as html_escape
 from flask import Flask, request, render_template_string
 from pyngrok import ngrok
 import instagrapi
 from instagrapi import Client
+from instagrapi.exceptions import TwoFactorRequired
 
 try:
     from PIL import Image
@@ -1051,7 +1051,16 @@ class InstagramClient:
         try:
             cls._configure_client(client, legacy=(LOGIN_STRATEGY == "legacy_first"))
             if LOGIN_STRATEGY == "legacy_first" and hasattr(client, "login_legacy"):
-                ok = client.login_legacy(IG_USERNAME, IG_PASSWORD)
+                try:
+                    ok = client.login_legacy(IG_USERNAME, IG_PASSWORD)
+                except TwoFactorRequired:
+                    from getpass import getpass
+                    code = getpass("🔐 Instagram verification code (2FA/backup code): ").strip()
+                    if not code:
+                        raise
+                    ok = client.login_legacy(
+                        IG_USERNAME, IG_PASSWORD, verification_code=code
+                    )
             else:
                 ok = client.login(IG_USERNAME, IG_PASSWORD)
             if ok is False:
@@ -2910,6 +2919,10 @@ opacity:0.6;font-size:clamp(0.65rem,1.8vw,0.8rem)}
 # ============================================================
 # 10. الواجهة
 # ============================================================
+# تنفيذ Instagram واحد في كل مرة لكل جلسة Colab.
+# يمنع تداخل /start و /search على نفس client.
+INSTAGRAM_JOB_LOCK = threading.Lock()
+
 app = Flask(__name__)
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -3155,12 +3168,21 @@ def start_scrape():
     if not u: return "❌ اسم المستخدم مطلوب", 400
 
     def task():
+        if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+            TelegramSender.send_message(
+                "⏳ <b>هناك مهمة Instagram أخرى قيد التنفيذ</b>\n"
+                "تم رفض المهمة الجديدة مؤقتًا لمنع تداخل الطلبات و429."
+            )
+            return
         try:
-            InstagramSearcher().get_profile_info(u)
-            InstagramSearcher().scrape(u, mp, sm_, o, fc, mc, ff, mf, fs, ms, fh, mh)
+            searcher = InstagramSearcher()
+            searcher.get_profile_info(u)
+            searcher.scrape(u, mp, sm_, o, fc, mc, ff, mf, fs, ms, fh, mh)
         except Exception as e:
             traceback.print_exc()
-            TelegramSender.send_message(f"❌ {e}")
+            TelegramSender.send_message(f"❌ {html_escape(str(e)[:800])}")
+        finally:
+            INSTAGRAM_JOB_LOCK.release()
 
     threading.Thread(target=task).start()
     mn = {'posts_only': '📸 منشورات', 'posts_and_videos': '📸🎬+فيديو', 'smart_merge': '🧠 دمج'}
@@ -3179,6 +3201,12 @@ def start_search():
     if not query: return "❌ الاستعلام مطلوب", 400
 
     def task():
+        if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+            TelegramSender.send_message(
+                "⏳ <b>هناك مهمة Instagram أخرى قيد التنفيذ</b>\n"
+                "تم رفض البحث الجديد مؤقتًا لمنع تداخل الطلبات و429."
+            )
+            return
         try:
             searcher = InstagramSearcher()
             results = searcher.universal_searcher.search(
@@ -3191,7 +3219,9 @@ def start_search():
             TelegramSender.send_message(f"✅ *اكتمل البحث*\n📝 `{query}`\n📊 إجمالي النتائج: {results['stats']['total']}\n💾 Cache: {len(ThumbnailEngine._url_cache)} صورة")
         except Exception as e:
             traceback.print_exc()
-            TelegramSender.send_message(f"❌ خطأ في البحث: {e}")
+            TelegramSender.send_message(f"❌ خطأ في البحث: {html_escape(str(e)[:800])}")
+        finally:
+            INSTAGRAM_JOB_LOCK.release()
 
     threading.Thread(target=task).start()
     return f"✅ جاري البحث الشامل عن: {query}", 200
