@@ -713,6 +713,17 @@ class InstagramClient:
         if cls._client is not None:
             return cls._client
 
+        # إذا كان المستخدم قد زود Session ID، فاسمح باستخدامه حتى أثناء
+        # cooldown الخاص بمحاولة password السابقة؛ فهو مسار مصادقة مختلف.
+        runtime_sessionid = cls._get_runtime_sessionid()
+        if runtime_sessionid:
+            try:
+                session_client = cls._configure_client(Client())
+                if cls._activate_sessionid(session_client, runtime_sessionid, "Session ID"):
+                    return cls._client
+            except Exception:
+                pass
+
         # منع إعادة ضرب endpoint تسجيل الدخول أثناء فترة 429/الرفض المؤقت
         if cls._last_login_failure_at:
             elapsed = time.time() - cls._last_login_failure_at
