@@ -553,7 +553,9 @@ class InstagramClient:
     _save_counter = 0
     _last_login_failure_at = 0.0
     _last_login_error = ""
+    _last_sessionid_failure_at = 0.0
     _LOGIN_COOLDOWN_SECONDS = 900
+    _SESSIONID_COOLDOWN_SECONDS = 900
     _SESSION_FILE = ("/content/drive/MyDrive/ig_tool_session.json" if IN_COLAB
                      else "ig_tool_session.json")
     
@@ -682,12 +684,14 @@ class InstagramClient:
             cls._last_login_failure_at = 0.0
             cls._last_login_error = ""
             cls._save_session(force=True)
+            cls._last_sessionid_failure_at = 0.0
             print(f"✅ تم إنشاء جلسة Instagram من {source}")
             TelegramSender.send_message("✅ *جلسة Instagram نشطة عبر Session ID*")
             return True
         except Exception as e:
             status, message = cls._login_error_details(e)
             detail = f"HTTP {status}: {message}" if status else message
+            cls._last_sessionid_failure_at = time.time()
             print(f"⚠️ فشل {source}: {detail}")
             return False
 
@@ -713,21 +717,22 @@ class InstagramClient:
         if cls._client is not None:
             return cls._client
 
-        # إذا كان المستخدم قد زود Session ID، فاسمح باستخدامه حتى أثناء
-        # cooldown الخاص بمحاولة password السابقة؛ فهو مسار مصادقة مختلف.
-        runtime_sessionid = cls._get_runtime_sessionid()
-        if runtime_sessionid:
-            try:
-                session_client = cls._configure_client(Client())
-                if cls._activate_sessionid(session_client, runtime_sessionid, "Session ID"):
-                    return cls._client
-            except Exception:
-                pass
-
-        # منع إعادة ضرب endpoint تسجيل الدخول أثناء فترة 429/الرفض المؤقت
+        # منع إعادة ضرب endpoint تسجيل الدخول أثناء فترة 429/الرفض المؤقت.
+        # يسمح فقط بمسار Session ID مختلف إذا كان المستخدم قد وفره ولم
+        # تتم تجربته وفشله خلال نفس فترة التهدئة.
         if cls._last_login_failure_at:
             elapsed = time.time() - cls._last_login_failure_at
             if elapsed < cls._LOGIN_COOLDOWN_SECONDS:
+                runtime_sessionid = cls._get_runtime_sessionid()
+                session_elapsed = time.time() - cls._last_sessionid_failure_at if cls._last_sessionid_failure_at else float("inf")
+                if runtime_sessionid and session_elapsed >= cls._SESSIONID_COOLDOWN_SECONDS:
+                    try:
+                        session_client = cls._configure_client(Client())
+                        if cls._activate_sessionid(session_client, runtime_sessionid, "Session ID أثناء cooldown"):
+                            return cls._client
+                    except Exception:
+                        pass
+
                 remaining = int(cls._LOGIN_COOLDOWN_SECONDS - elapsed)
                 print(f"⏳ آخر محاولة دخول فشلت. لن نكرر تسجيل الدخول الآن؛ المتبقي تقريباً {remaining}s")
                 if cls._last_login_error:
