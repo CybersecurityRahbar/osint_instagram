@@ -135,3 +135,8 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Static API compatibility remains consistent with instagrapi 3.x: saved sessions use `load_settings(..., override_app_version=True)` and private transport migration to curl when supported.
 - Live authentication is still not testable from this environment because the user's Instagram account and Colab runtime are private.
 
+### Session ID fallback hardening
+- Session ID recovery is throttled separately so an invalid Session ID cannot create a new rapid retry loop.
+- During the password-login cooldown, a configured Session ID may still be attempted as the alternate authentication path, but only under its own cooldown.
+- Saved Drive sessions remain the preferred persistent session source; Session ID is a bootstrap/recovery mechanism.
+
