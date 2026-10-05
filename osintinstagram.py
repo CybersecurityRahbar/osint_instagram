@@ -344,9 +344,18 @@ def init_db():
 
 def save_or_update_account(info):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO accounts
+    c.execute('''INSERT INTO accounts
         (username, full_name, bio, followers, following, posts_count,
-         is_private, is_verified, last_scraped) VALUES (?,?,?,?,?,?,?,?,?)''',
+         is_private, is_verified, last_scraped) VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(username) DO UPDATE SET
+            full_name=excluded.full_name,
+            bio=excluded.bio,
+            followers=excluded.followers,
+            following=excluded.following,
+            posts_count=excluded.posts_count,
+            is_private=excluded.is_private,
+            is_verified=excluded.is_verified,
+            last_scraped=excluded.last_scraped''',
         (info['username'], info['full_name'], info['bio'], info['followers'],
          info['following'], info['posts_count'], int(info['is_private']),
          int(info['is_verified']), datetime.now().isoformat()))
@@ -841,7 +850,7 @@ class UniversalSearcher:
             print(f"      ⚠️ search_music: {type(e).__name__}")
         return []
     
-    def search(self, query, max_results_per_type=10):
+    def search(self, query, max_results_per_type=10, hunt_mentions=True):
         analysis = self.analyze_query(query)
         print(f"🔍 بحث شامل: '{query}' — النوع: {analysis['type']}")
         
@@ -896,9 +905,13 @@ class UniversalSearcher:
             print(f"   ✅ music: {len(results['music'])}")
             InstagramClient.human_delay(1, 2)
         
-        # 6. Mention Hunter
-        results['mentions'] = self._hunt_mentions(query, 5, 30)
-        print(f"   🎯 mentions: {len(results['mentions'])}")
+        # 6. Mention Hunter — optional because it adds hashtag + comment requests
+        if hunt_mentions:
+            results['mentions'] = self._hunt_mentions(query, 5, 30)
+            print(f"   🎯 mentions: {len(results['mentions'])}")
+        else:
+            results['mentions'] = []
+            print("   ⏭️ Mention Hunter معطّل")
         
         results['stats']['total'] = (len(results['users']) + len(results['hashtags']) + 
                                      len(results['posts']) + len(results['reels']) + 
@@ -1402,9 +1415,20 @@ class InstagramSearcher:
             if need_full:
                 posts = self._fetch_posts_full(user_id); posts.sort(key=lambda x: x.taken_at)
                 clips = self._fetch_clips_full(user_id); clips.sort(key=lambda x: x.taken_at)
-                return posts[:count] + clips[:count]
-            return (self.client.user_medias(user_id, amount=count) +
-                    self._fetch_clips_full(user_id, max_total=count))
+            else:
+                posts = self.client.user_medias(user_id, amount=count)
+                clips = self._fetch_clips_full(user_id, max_total=count)
+
+            # دمج النوعين ثم إزالة التكرار وفرض العدد المطلوب فعلياً.
+            combined = posts + clips
+            seen, uniq = set(), []
+            for m in combined:
+                pk = getattr(m, 'pk', None)
+                if pk not in seen:
+                    seen.add(pk)
+                    uniq.append(m)
+            uniq.sort(key=lambda x: x.taken_at, reverse=not need_full)
+            return uniq[:count]
         if need_full:
             posts = self._fetch_posts_full(user_id)
             clips = self._fetch_clips_full(user_id)
@@ -1417,8 +1441,7 @@ class InstagramSearcher:
         else:
             posts = self.client.user_medias(user_id, amount=count * 2)
             clips = self._fetch_clips_full(user_id, max_total=count * 2)
-            extra = self.client.user_medias(user_id, amount=count * 3)
-            combined = posts + clips + [m for m in extra if m.media_type == 2]
+            combined = posts + clips
             seen, uniq = set(), []
             for m in combined:
                 if m.pk not in seen: seen.add(m.pk); uniq.append(m)
@@ -2428,7 +2451,9 @@ def start_search():
     def task():
         try:
             searcher = InstagramSearcher()
-            results = searcher.universal_searcher.search(query, max_per_type)
+            results = searcher.universal_searcher.search(
+                query, max_per_type, hunt_mentions=hunt_mentions
+            )
             
             if generate_report:
                 searcher.universal_searcher.generate_search_report(query, results)
