@@ -44,7 +44,7 @@ if INSTAGRAPI_VERSION != REQUIRED_INSTAGRAPI_VERSION:
         "ثبّت النسخة المطلوبة في خلية التثبيت المنفصلة ثم أعد تشغيل خلية الأداة."
     )
 
-import os, json, io, time, random, requests, threading, sqlite3, traceback, csv, re, base64
+import os, shutil, json, io, time, random, requests, threading, sqlite3, traceback, csv, re, base64
 from functools import lru_cache
 from datetime import datetime
 from html import escape as html_escape
@@ -451,13 +451,63 @@ class ThumbnailEngine:
 # ============================================================
 # 6. قاعدة البيانات
 # ============================================================
+def _table_exists(cursor, table):
+    cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+    return cursor.fetchone() is not None
+
+
 def _table_columns(cursor, table):
     cursor.execute(f"PRAGMA table_info({table})")
     return {row[1] for row in cursor.fetchall()}
 
+def _backup_db_before_migration(reason="schema"):
+    """إنشاء نسخة احتياطية تلقائية قبل أي تغيير في قاعدة البيانات."""
+    try:
+        if not DB_PATH or not os.path.exists(DB_PATH):
+            return None
+        backup_dir = os.path.join(BASE_PATH, "db_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(backup_dir, f"instagram_scraper_{reason}_{stamp}.sqlite")
+        shutil.copy2(DB_PATH, backup_path)
+        print(f"🛡️ نسخة احتياطية لقاعدة البيانات: {backup_path}")
+        return backup_path
+    except Exception as e:
+        print(f"⚠️ تعذر إنشاء نسخة قاعدة البيانات الاحتياطية: {e}")
+        return None
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # اكتشاف تغييرات schema قبل تنفيذها، ثم أخذ نسخة كاملة واحدة من DB.
+    needs_backup = False
+    if os.path.exists(DB_PATH):
+        try:
+            post_existing = _table_columns(c, 'posts') if _table_exists(c, 'posts') else set()
+            story_existing = _table_columns(c, 'stories') if _table_exists(c, 'stories') else set()
+            follower_global_unique = False
+            if _table_exists(c, 'followers'):
+                c.execute("PRAGMA index_list(followers)")
+                for idx in c.fetchall():
+                    if len(idx) >= 3 and idx[2]:
+                        c.execute(f"PRAGMA index_info({idx[1]})")
+                        if [row[2] for row in c.fetchall()] == ["username"]:
+                            follower_global_unique = True
+                            break
+            needs_backup = (
+                ('view_count' not in post_existing)
+                or ('play_count' not in post_existing)
+                or ('thumbnail_url' not in story_existing)
+                or ('story_url' not in story_existing)
+                or follower_global_unique
+            )
+        except Exception:
+            needs_backup = True
+
+    if needs_backup:
+        _backup_db_before_migration("before_schema_migration")
     
     c.execute('''CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE,
