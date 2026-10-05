@@ -44,3 +44,37 @@
 
 ## Future log
 Append every future investigation, decision, code change, test result, and unresolved issue here so the project history remains cumulative.
+
+
+## 2026-10-05 — Secondary audit after login repair
+
+### Additional request-volume and data-integrity findings
+- Smart Merge (newest-first) made a redundant second `user_medias()` request after already fetching enough media. This was unnecessary request volume and could worsen Instagram throttling.
+- The Posts + Videos mode could return up to roughly twice the requested count because it concatenated `count` posts and `count` clips. It now merges, deduplicates, sorts, and enforces the requested final count.
+- The UI exposed a Mention Hunter checkbox, but the backend ignored it: `UniversalSearcher.search()` always ran Mention Hunter. Mention Hunter makes additional hashtag and comment requests. The backend now honors the checkbox.
+- `accounts` used `INSERT OR REPLACE`, which can replace the row and change its primary key. It now uses SQLite `ON CONFLICT(username) DO UPDATE`, preserving the account row identity and its foreign-key relationships.
+
+### Remaining important findings not yet fully refactored
+- `followers.username` is globally UNIQUE, so the same follower cannot be stored independently for multiple target accounts.
+- `fetch_highlights()` currently stores highlight metadata but does not actually download highlight items despite the UI wording suggesting full highlight retrieval.
+- The ngrok/Flask interface is publicly reachable and has no application-level authentication. Anyone who obtains the ngrok URL can submit `/start` or `/search` while the process owns an authenticated Instagram session. This should be fixed before treating the tool as safe for long-lived/public deployment.
+- The thumbnail cache is labeled LRU but is implemented as insertion-order eviction rather than true least-recently-used behavior.
+
+### Current validation
+- Static verification after the second patch confirms:
+  - no remaining `set_app_version` call;
+  - no remaining `set_settings(..., override_app_version=...)` call;
+  - saved sessions use `load_settings(..., override_app_version=True)`;
+  - private transport migration to curl is present when supported;
+  - dependency is pinned to `instagrapi==3.0.20`;
+  - 429 login cooldown is present;
+  - Mention Hunter checkbox is honored;
+  - redundant Smart Merge request was removed;
+  - story_url migration is present.
+- Live Instagram authentication remains unverified here because the user's Colab runtime, Google Drive session file, and account are not accessible to this environment.
+
+### Current upstream note
+- As of 2026-10-05, instagrapi 3.0.20 is the latest release. Its release notes include use of the native Android 449 profile and preservation of CAA login context. The v3 migration guide documents `load_settings(..., override_app_version=True)`, CAA login, and curl-based private HTTP/2 transport migration.
+
+### Next user test
+Do not delete the existing Drive session before testing. First restart/clean the Colab runtime, install the pinned dependency, verify the installed version, confirm the session file exists, and run the script once. If Instagram still returns HTTP 429 from the CAA login endpoint, stop retrying and treat it as an Instagram-side throttle rather than a Python exception to brute-force around.
