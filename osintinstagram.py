@@ -830,7 +830,11 @@ class InstagramClient:
         if cls._client is None:
             return False
         try:
-            cls._client.user_timeline(amount=1)
+            # instagrapi 3.x removed user_timeline(); account_info() is
+            # the current authenticated-account validation call.
+            if not hasattr(cls._client, "account_info"):
+                raise AttributeError("Client 3.x لا يحتوي account_info()")
+            cls._client.account_info()
             return True
         except Exception as e:
             status, message = cls._login_error_details(e)
