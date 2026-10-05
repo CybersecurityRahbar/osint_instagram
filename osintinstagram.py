@@ -1125,8 +1125,8 @@ class UniversalSearcher:
     def _safe_search_users(self, query, count):
         """بحث آمن عن المستخدمين"""
         try:
-            result = self.client.search_users(query, count)
-            return list(result) if result else []
+            result = self.client.search_users(query)
+            return list(result)[:count] if result else []
         except Exception as e:
             print(f"      ⚠️ search_users: {type(e).__name__}: {str(e)[:60]}")
             return []
@@ -1136,8 +1136,8 @@ class UniversalSearcher:
         # المحاولة 1: search_hashtags
         try:
             if hasattr(self.client, 'search_hashtags'):
-                result = self.client.search_hashtags(query, count)
-                return list(result) if result else []
+                result = self.client.search_hashtags(query)
+                return list(result)[:count] if result else []
         except Exception as e:
             print(f"      ⚠️ search_hashtags (v1): {type(e).__name__}")
         
@@ -1181,8 +1181,8 @@ class UniversalSearcher:
         """بحث آمن عن الريلز"""
         try:
             if hasattr(self.client, 'search_reels'):
-                result = self.client.search_reels(query, count)
-                return list(result) if result else []
+                result = self.client.search_reels(query)
+                return list(result)[:count] if result else []
         except Exception as e:
             print(f"      ⚠️ search_reels: {type(e).__name__}")
         return []
@@ -1191,8 +1191,8 @@ class UniversalSearcher:
         """بحث آمن عن الأغاني"""
         try:
             if hasattr(self.client, 'search_music'):
-                result = self.client.search_music(query, count)
-                return list(result) if result else []
+                result = self.client.search_music(query)
+                return list(result)[:count] if result else []
         except Exception as e:
             print(f"      ⚠️ search_music: {type(e).__name__}")
         return []
