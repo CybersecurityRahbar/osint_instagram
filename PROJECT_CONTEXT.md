@@ -297,3 +297,11 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Static source review completed for login strategy, private v1 story/follower/highlight paths, native story/media download, view/play metrics, follower DB migration, and legacy-session isolation.
 - Live authentication/data collection still requires testing by the user in Colab with an authorized account after the account-security warning is fully resolved.
 
+### Final hardening in this iteration
+- The legacy strategy uses a new session filename `ig_tool_session_legacy_v3.json` so the next test does not reuse the browser-cloned session file that caused the account security incident.
+- `login_legacy()` is given `private_transport="requests"` consistently for both initial and saved-session clients.
+- Optional 2FA/TOTP/SMS/backup-code entry is handled through `getpass()` when instagrapi raises `TwoFactorRequired`; no codes are stored in GitHub.
+- Instagram jobs are serialized with a process-wide lock so simultaneous `/start` and `/search` requests cannot create bursts against one authenticated session.
+- Follower names are sent in numbered groups of 20, preserving all requested entries without Telegram's 4096-character truncation.
+- The old browser Session ID code path remains disabled.
+
