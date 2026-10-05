@@ -78,3 +78,27 @@ Append every future investigation, decision, code change, test result, and unres
 
 ### Next user test
 Do not delete the existing Drive session before testing. First restart/clean the Colab runtime, install the pinned dependency, verify the installed version, confirm the session file exists, and run the script once. If Instagram still returns HTTP 429 from the CAA login endpoint, stop retrying and treat it as an Instagram-side throttle rather than a Python exception to brute-force around.
+
+## 2026-10-05 — Single-cell Colab dependency workflow
+
+### User workflow decision
+- The user runs the entire Instagram OSINT tool by pasting the complete `osintinstagram.py` content into ONE Google Colab cell.
+- The user does not want `requirements.txt` or other dependency files added to the Colab workflow.
+- Dependency-installation commands will be run manually by the user in a separate Colab cell.
+
+### Implementation change
+- Removed `requirements.txt` from the repository.
+- Embedded `REQUIRED_INSTAGRAPI_VERSION = "3.0.20"` directly inside `osintinstagram.py`.
+- `osintinstagram.py` now checks the installed instagrapi version before importing it.
+- If the required version is missing or different, the script stops with a clear message telling the user to install the required version in the separate installation cell.
+- This avoids silent API changes while preserving the user's preferred one-cell tool workflow.
+
+### Current Colab installation command
+```python
+!pip install -q --force-reinstall instagrapi==3.0.20
+```
+
+### Validation note
+- The repository now contains no external requirements file for this workflow.
+- The main tool remains a single-file/single-cell implementation.
+
