@@ -158,6 +158,55 @@ class TelegramSender:
         return text_value.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", '"')
 
     @staticmethod
+    def send_follower_list(username, followers):
+        """إرسال قائمة المتابعين كاملة على دفعات مرقمة دون تجاوز حد الرسالة."""
+        followers = list(followers or [])
+        total = len(followers)
+        if total == 0:
+            return False
+
+        chunk_size = 20
+        for start_idx in range(0, total, chunk_size):
+            chunk = followers[start_idx:start_idx + chunk_size]
+            lines = []
+            for absolute_idx, follower in enumerate(chunk, start_idx + 1):
+                uname = html_escape(str(getattr(follower, "username", "") or ""))
+                fullname = html_escape(str(getattr(follower, "full_name", "") or "—"))
+                lines.append(f"<b>{absolute_idx:03d}.</b> @{uname} — {fullname}")
+            html_text = (
+                f"<b>👥 المتابعون — @{html_escape(username.lstrip('@'))}</b>\n"
+                f"📦 {start_idx + 1}–{start_idx + len(chunk)} من {total}\n\n"
+                + "\n".join(lines)
+            )
+            TelegramSender.send_message_html(html_text)
+            time.sleep(0.7)
+        return True
+
+    @staticmethod
+    def send_message_html(html_text, retries=2):
+        for i in range(retries + 1):
+            try:
+                r = _http_session.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": html_text[:4096],
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": "true",
+                    },
+                    timeout=15)
+                if r.status_code == 200:
+                    return True
+            except Exception as e:
+                if i < retries:
+                    time.sleep(1.5)
+                else:
+                    print(f"⚠️ Telegram HTML: {e}")
+            if i < retries:
+                time.sleep(1.5)
+        return False
+
+    @staticmethod
     def _post_keyboard(url, profile_url=None):
         rows = [[{"text": "🔗 فتح المنشور", "url": url}]]
         if profile_url:
@@ -432,7 +481,8 @@ def init_db():
     
     c.execute('''CREATE TABLE IF NOT EXISTS followers (
         id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
-        username TEXT UNIQUE, full_name TEXT, first_seen DATETIME,
+        username TEXT, full_name TEXT, first_seen DATETIME,
+        UNIQUE(account_id, username),
         FOREIGN KEY(account_id) REFERENCES accounts(id))''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS stories (
@@ -481,6 +531,33 @@ def init_db():
         if 'thumbnail_url' not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN thumbnail_url TEXT")
             print(f"🔧 Migration: أضيف thumbnail_url لـ {table}")
+    # Migration: النسخ القديمة كانت تجعل username فريدًا على مستوى كل القاعدة،
+    # مما يمنع تخزين نفس المتابع تحت حسابين مختلفين.
+    c.execute("PRAGMA index_list(followers)")
+    follower_indexes = c.fetchall()
+    global_unique_username = False
+    for idx in follower_indexes:
+        if len(idx) >= 3 and idx[2]:
+            idx_name = idx[1]
+            c.execute(f"PRAGMA index_info({idx_name})")
+            idx_cols = [row[2] for row in c.fetchall()]
+            if idx_cols == ["username"]:
+                global_unique_username = True
+                break
+    if global_unique_username:
+        print("🔧 Migration: إصلاح uniqueness للمتابعين إلى (account_id, username)")
+        c.execute("PRAGMA foreign_keys=OFF")
+        c.execute('''CREATE TABLE followers_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
+            username TEXT, full_name TEXT, first_seen DATETIME,
+            UNIQUE(account_id, username),
+            FOREIGN KEY(account_id) REFERENCES accounts(id))''')
+        c.execute('''INSERT OR IGNORE INTO followers_new
+            (id, account_id, username, full_name, first_seen)
+            SELECT id, account_id, username, full_name, first_seen FROM followers''')
+        c.execute("DROP TABLE followers")
+        c.execute("ALTER TABLE followers_new RENAME TO followers")
+        c.execute("PRAGMA foreign_keys=ON")
     # إصلاح قاعدة بيانات قديمة لم يكن فيها story_url رغم أن save_story يستخدمه.
     story_cols = _table_columns(c, 'stories')
     if 'story_url' not in story_cols:
@@ -718,8 +795,9 @@ class InstagramClient:
     _last_session_validation_at = 0.0
     _LOGIN_COOLDOWN_SECONDS = 900
     _SESSIONID_COOLDOWN_SECONDS = 900
-    _SESSION_FILE = ("/content/drive/MyDrive/ig_tool_session.json" if IN_COLAB
-                     else "ig_tool_session.json")
+    # جلسة مستقلة مملوكة للأداة؛ لا تستخدم ملف Session ID السابق من المتصفح.
+    _SESSION_FILE = ("/content/drive/MyDrive/ig_tool_session_legacy_v3.json" if IN_COLAB
+                     else "ig_tool_session_legacy_v3.json")
     
     # 🎯 Cache ذكي لـ user_id - يمنع 429
     _user_id_cache = {}
@@ -870,7 +948,7 @@ class InstagramClient:
                 "session_retry_backoff_factor": 1,
                 "session_retry_statuses": [429, 500, 502, 503, 504],
             }
-            if legacy:
+            if legacy or LOGIN_STRATEGY == "legacy_first":
                 kwargs["private_transport"] = PRIVATE_TRANSPORT_FOR_LOGIN
             else:
                 kwargs["private_transport"] = "curl"
@@ -2201,7 +2279,10 @@ class InstagramSearcher:
 
             if fetch_comments and int(getattr(media, 'comment_count', 0) or 0) > 0:
                 try:
-                    comments = self.client.media_comments(media.pk, amount=max_comments)
+                    if hasattr(self.client, "media_comments_v1"):
+                        comments = self.client.media_comments_v1(media.pk, amount=max_comments)
+                    else:
+                        comments = self.client.media_comments(media.pk, amount=max_comments)
                     for c in comments:
                         save_comment(pid, c)
                 except Exception as ce:
@@ -2395,17 +2476,11 @@ class InstagramSearcher:
                         fl = self.client.user_followers_v1(uid, amount=max_followers)
                     else:
                         fl = list(self.client.user_followers(uid, amount=max_followers).values())
-                    for follower in fl[:max_followers]:
+                    fl = list(fl)[:max_followers]
+                    for follower in fl:
                         save_follower(account_id, follower)
-                    follower_preview = "\n".join(
-                        f"{i:03d}. @{getattr(follower, 'username', '')} — {getattr(follower, 'full_name', '')}".strip()
-                        for i, follower in enumerate(fl[:max_followers], 1)
-                    )
-                    TelegramSender.send_rich_message(
-                        f"<b>👥 المتابعون — {html_escape(username)}</b>\n"
-                        f"📦 تم جلب: <b>{len(fl[:max_followers])}</b>\n\n"
-                        f"<blockquote>{html_escape(follower_preview[:3000])}</blockquote>"
-                    )
+                    print(f"👥 تم جلب {len(fl)} متابع من الحد المطلوب {max_followers}")
+                    TelegramSender.send_follower_list(username, fl)
                 except Exception as fe:
                     if "challenge" in str(fe).lower() or "manual verification" in str(fe).lower():
                         InstagramClient._mark_challenge(fe)
