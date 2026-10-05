@@ -746,7 +746,7 @@ class InstagramClient:
     
     @classmethod
     def get_user_id_cached(cls, client, username):
-        """حل اسم مستخدم مباشر بدون استدعاء واجهة Search."""
+        """حل اسم مستخدم مباشر عبر Private Mobile API فقط."""
         username = str(username or "").lower().strip().lstrip("@")
         if not username:
             return None
@@ -754,9 +754,11 @@ class InstagramClient:
         if username in cls._user_id_cache:
             return cls._user_id_cache[username]
 
-        # اسم مستخدم مباشر: نستخدم user_info_by_username() أولاً.
         try:
-            user = client.user_info_by_username(username)
+            if hasattr(client, "user_info_by_username_v1"):
+                user = client.user_info_by_username_v1(username)
+            else:
+                user = client.user_info_by_username(username)
             uid = str(getattr(user, "pk", "") or "")
             actual_username = str(getattr(user, "username", username) or username).lower()
             if uid:
@@ -767,9 +769,9 @@ class InstagramClient:
         except Exception as e:
             if cls._is_rate_limit_error(e):
                 cls._mark_throttle(e)
-            print(f"      ⚠️ user_info_by_username: {type(e).__name__}: {str(e)[:100]}")
+            print(f"      ⚠️ private username lookup: {type(e).__name__}: {str(e)[:120]}")
 
-        # fallback واحد فقط
+        # Fallback داخل private API فقط.
         try:
             uid = str(client.user_id_from_username(username))
             if uid:
@@ -934,7 +936,7 @@ class InstagramClient:
         if os.path.exists(cls._SESSION_FILE):
             try:
                 client.load_settings(cls._SESSION_FILE, override_app_version=True)
-                cls._configure_client(client)
+                cls._configure_client(client, legacy=(LOGIN_STRATEGY == "legacy_first"))
                 session_loaded = True
                 print("♻️ تم تحميل الجلسة المحفوظة مع ترقية ملف app profile")
 
@@ -969,7 +971,7 @@ class InstagramClient:
         # 3) لا نصل إلى login() إلا عندما لا توجد جلسة قابلة للاستخدام
         #    أو تحتاج الجلسة إلى إعادة مصادقة.
         try:
-            cls._configure_client(client)
+            cls._configure_client(client, legacy=(LOGIN_STRATEGY == "legacy_first"))
             if LOGIN_STRATEGY == "legacy_first" and hasattr(client, "login_legacy"):
                 ok = client.login_legacy(IG_USERNAME, IG_PASSWORD)
             else:
@@ -2138,11 +2140,14 @@ class InstagramSearcher:
         comments = int(getattr(media, 'comment_count', 0) or 0)
         profile_url = f"https://www.instagram.com/{html_escape(username)}/"
 
+        views = int(getattr(media, "view_count", 0) or 0)
+        plays = int(getattr(media, "play_count", 0) or 0)
+        view_line = f"👁️ {views:,}" if views else (f"▶️ {plays:,}" if plays else "👁️ —")
         return (
             f"<b>📌 المنشور #{index:02d} / {total:02d}</b>  •  <code>{code}</code>\n"
             f"👤 <a href=\"{profile_url}\">@{html_escape(username)}</a>\n"
             f"📅 {date_text}\n"
-            f"❤️ {likes:,}   💬 {comments:,}\n"
+            f"❤️ {likes:,}   💬 {comments:,}   {view_line}\n"
             f"\n<blockquote>{caption}</blockquote>\n"
             f'<a href="{url}">🔗 فتح المنشور على Instagram</a>'
         )
@@ -2229,7 +2234,10 @@ class InstagramSearcher:
         print(f"📊 معلومات: {username}")
         try:
             # اسم مستخدم مباشر: جلب الملف الكامل مباشرة بدون Search endpoint.
-            u = self.client.user_info_by_username(username)
+            if hasattr(self.client, "user_info_by_username_v1"):
+                u = self.client.user_info_by_username_v1(username)
+            else:
+                u = self.client.user_info_by_username(username)
             uid = str(getattr(u, 'pk', '') or '')
             if uid:
                 InstagramClient._user_id_cache[str(username).lower().lstrip('@')] = uid
