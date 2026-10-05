@@ -38,3 +38,12 @@ See PROJECT_CONTEXT.md for the cumulative investigation log and engineering deci
 - Profile retrieval sends the profile picture together with account statistics and public profile details.
 - HTTP 429 is treated as a temporary Instagram throttle, not automatic logout; the session is preserved.
 
+
+
+## Authentication and data collection architecture
+
+The project now uses instagrapi's explicit `login_legacy()` path for fresh username/password authentication, with the private `requests` transport selected for compatibility with the proven pre-v3 architecture. After the first successful login, the tool persists its own session settings in Google Drive and reuses them.
+
+For authenticated profile collection, the tool prefers private/mobile API methods for profile lookup, Stories, Followers, Highlights, and comments. It uses native instagrapi download helpers for posts, videos, albums, and Stories, and records like/comment/view/play metrics when returned.
+
+Browser Session ID cloning is intentionally disabled because it caused account security challenges in testing. The tool also stops on HTTP 429 or native security challenges rather than attempting to bypass them.
