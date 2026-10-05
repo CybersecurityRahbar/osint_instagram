@@ -140,3 +140,37 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - During the password-login cooldown, a configured Session ID may still be attempted as the alternate authentication path, but only under its own cooldown.
 - Saved Drive sessions remain the preferred persistent session source; Session ID is a bootstrap/recovery mechanism.
 
+## 2026-10-05 — Session authentication succeeded; post-login API mismatch found
+
+### New runtime evidence
+- The password/CAA login returned HTTP 429 as before.
+- The new Session ID fallback then returned:
+  `✅ تم إنشاء جلسة Instagram من Session ID بعد 429`
+- Therefore Instagram authentication itself succeeded through the Session ID path.
+- Immediately afterward, the tool's session validation raised:
+  `AttributeError: 'Client' object has no attribute 'user_timeline'`
+- The error appeared twice during the `/start` processing.
+
+### Root cause
+- `user_timeline()` is an obsolete API call in this project and is not present in instagrapi 3.0.20.
+- Current instagrapi 3.0.20 exposes `account_info()` for retrieving/validating the authenticated account. The 3.0.20 documentation also documents current timeline methods such as `get_timeline_feed()`; `user_timeline()` is not the current validation API.
+
+### Fix
+- Replaced `refresh_if_needed()` validation call from `user_timeline(amount=1)` to `account_info()`.
+- Added a stronger saved-session path: after loading `ig_tool_session.json`, the tool validates it with `account_info()`. If valid, it immediately reuses the session and does NOT call `login(username, password)` again.
+- If saved-session validation itself returns 429, the tool now stops rather than falling through to another password/CAA login.
+- This prevents unnecessary login requests after a successful Session ID bootstrap and reduces the chance of repeated throttling.
+
+### Current expected successful flow
+1. Existing saved session is loaded.
+2. `account_info()` validates it.
+3. If valid: continue directly with the authenticated client.
+4. Only if no valid saved session exists: use configured Session ID.
+5. Only if no usable Session ID exists: attempt password/CAA once.
+6. On CAA 429: never blindly retry password/CAA.
+
+### Validation status
+- Static scan confirms the functional `user_timeline()` call was removed; only a comment mentions the obsolete name.
+- Current session validation now targets `account_info()`.
+- Live Colab execution is still the final required validation step because the actual Instagram session is private.
+
