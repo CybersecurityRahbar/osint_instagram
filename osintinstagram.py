@@ -767,6 +767,12 @@ class InstagramClient:
             status, message = cls._login_error_details(exc)
             if status or message:
                 cls._last_login_error = f"HTTP {status}: {message}" if status else message
+        # 429 ليس logout؛ نحفظ آخر حالة للجلسة قبل إيقاف المهمة.
+        if cls._client is not None:
+            try:
+                cls._save_session(force=True)
+            except Exception:
+                pass
 
     @classmethod
     def is_throttled(cls):
@@ -998,15 +1004,17 @@ class InstagramClient:
         if cls._client is None:
             return False
 
+        # إذا كان Instagram قد فرض 429، لا نرسل أي طلب جديد حتى تنتهي
+        # فترة التهدئة. الجلسة نفسها تبقى محفوظة وفعالة.
+        if cls.is_throttled():
+            print(f"🛑 Instagram في فترة تهدئة بسبب 429 — المتبقي تقريباً {cls.throttle_remaining()}s")
+            return False
+
         # لا نرسل account_info() مع كل مهمة؛ نتحقق دورياً فقط.
         if cls._last_session_validation_at:
             age = time.time() - cls._last_session_validation_at
             if age < cls._SESSION_VALIDATION_INTERVAL_SECONDS:
                 return True
-
-        if cls.is_throttled():
-            print(f"🛑 Instagram في فترة تهدئة بسبب 429 — المتبقي تقريباً {cls.throttle_remaining()}s")
-            return False
 
         try:
             if not hasattr(cls._client, "account_info"):
@@ -1725,49 +1733,45 @@ class InstagramSearcher:
             print(f"   ⚠️ clips: {e}"); return []
 
     def _select_targets(self, user_id, count, mode, order):
+        """
+        Normal profile scraping uses user_medias(), which already returns the
+        user's feed media (photos, videos and Reels). The separate user_clips()
+        endpoint is reserved for explicit search/clip workflows and is not
+        needed for the normal profile task.
+        """
         need_full = (order == 'asc')
-        if mode == 'posts_only':
-            if need_full:
-                all_posts = self._fetch_posts_full(user_id)
-                all_posts.sort(key=lambda x: x.taken_at)
-                return all_posts[:count]
-            return self.client.user_medias(user_id, amount=count)
-        if mode == 'posts_and_videos':
-            if need_full:
-                posts = self._fetch_posts_full(user_id); posts.sort(key=lambda x: x.taken_at)
-                clips = self._fetch_clips_full(user_id); clips.sort(key=lambda x: x.taken_at)
-            else:
-                posts = self.client.user_medias(user_id, amount=count)
-                clips = self._fetch_clips_full(user_id, max_total=count)
 
-            # دمج النوعين ثم إزالة التكرار وفرض العدد المطلوب فعلياً.
-            combined = posts + clips
-            seen, uniq = set(), []
-            for m in combined:
-                pk = getattr(m, 'pk', None)
-                if pk not in seen:
-                    seen.add(pk)
-                    uniq.append(m)
-            uniq.sort(key=lambda x: x.taken_at, reverse=not need_full)
-            return uniq[:count]
         if need_full:
-            posts = self._fetch_posts_full(user_id)
-            clips = self._fetch_clips_full(user_id)
-            combined = posts + clips
-            seen, uniq = set(), []
-            for m in combined:
-                if m.pk not in seen: seen.add(m.pk); uniq.append(m)
-            uniq.sort(key=lambda x: x.taken_at)
-            return uniq[:count]
+            medias = self._fetch_posts_full(user_id)
+            medias.sort(key=lambda x: getattr(x, 'taken_at', datetime.min))
         else:
-            posts = self.client.user_medias(user_id, amount=count * 2)
-            clips = self._fetch_clips_full(user_id, max_total=count * 2)
-            combined = posts + clips
-            seen, uniq = set(), []
-            for m in combined:
-                if m.pk not in seen: seen.add(m.pk); uniq.append(m)
-            uniq.sort(key=lambda x: x.taken_at, reverse=True)
-            return uniq[:count]
+            # For the common newest-first workflow, one authenticated feed call
+            # is enough to obtain the requested number of publications.
+            request_amount = count
+            if mode == 'posts_only':
+                # A small over-fetch makes it possible to skip pure videos while
+                # still honoring the requested number of image/post entries.
+                request_amount = min(max(count * 3, count + 5), 100)
+            medias = self.client.user_medias(user_id, amount=request_amount)
+            medias.sort(key=lambda x: getattr(x, 'taken_at', datetime.min), reverse=True)
+
+        if mode == 'posts_only':
+            medias = [
+                m for m in medias
+                if int(getattr(m, 'media_type', 0) or 0) in (1, 8)
+            ]
+
+        # All current profile media are already represented by user_medias().
+        # Keep order, deduplicate by pk, then enforce the requested count.
+        seen, unique = set(), []
+        for media in medias:
+            pk = getattr(media, 'pk', None)
+            if pk in seen:
+                continue
+            seen.add(pk)
+            unique.append(media)
+
+        return unique[:count]
 
     def _fetch_stories_via_reels_media(self, user_id):
         try:
@@ -2256,10 +2260,18 @@ class InstagramSearcher:
 
             targets = self._select_targets(uid, max_posts, scrape_mode, order)
             if targets:
-                TelegramSender.send_message(
-                    f"📌 *{len(targets)} منشور* — @{username}\n"
-                    f"الوضع: {mode_names.get(scrape_mode)}\n"
-                    f"الترتيب: {'الأحدث' if order == 'desc' else 'الأقدم'}")
+                profile_url = f"https://www.instagram.com/{html_escape(username.lstrip('@'))}/"
+                intro_html = (
+                    f"<b>📦 Instagram OSINT</b>\n"
+                    f"<b>👤 @{html_escape(username.lstrip('@'))}</b>\n"
+                    f"📌 <b>{len(targets)}</b> منشور محدد للتنزيل\n"
+                    f"🧠 الوضع: <b>{html_escape(mode_names.get(scrape_mode, scrape_mode))}</b>\n"
+                    f"📅 الترتيب: <b>{'الأحدث' if order == 'desc' else 'الأقدم'}</b>"
+                )
+                TelegramSender.send_rich_message(
+                    intro_html,
+                    reply_markup=TelegramSender._post_keyboard(profile_url)
+                )
                 successful = 0
                 for i, m in enumerate(targets, 1):
                     if InstagramClient.is_throttled():
@@ -2299,7 +2311,12 @@ class InstagramSearcher:
             if html_p: TelegramSender.send_document(html_p, f"📄 HTML @{username}")
 
             InstagramClient._save_session(force=True)
-            TelegramSender.send_message(f"✅ *انتهى!*")
+            TelegramSender.send_rich_message(
+                f"<b>✅ اكتملت المهمة</b>\n"
+                f"👤 @{html_escape(username.lstrip('@'))}\n"
+                f"📦 المطلوب: <b>{len(targets) if targets else 0}</b>\n"
+                f"💾 تم حفظ النتائج والوسائط في Google Drive."
+            )
         except Exception as e:
             print(f"❌ {e}"); traceback.print_exc()
             TelegramSender.send_message(f"❌ {e}")
