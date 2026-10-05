@@ -102,3 +102,36 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - The repository now contains no external requirements file for this workflow.
 - The main tool remains a single-file/single-cell implementation.
 
+## 2026-10-05 — Instagram authentication 429 after dependency repair
+
+### New runtime evidence
+- With instagrapi==3.0.20 installed, the tool no longer shows the old `set_app_version` compatibility error.
+- A fresh runtime with no saved Instagram session now reaches the current CAA login endpoint and receives HTTP 429:
+  `https://b.i.instagram.com/api/v1/bloks/async_action/com.bloks.www.bloks.caa.login.async.send_login_request/`
+- Therefore the remaining failure is not the previous Python API mismatch. It is an Instagram-side throttling/anti-abuse response on the login path.
+
+### Upstream verification
+- Current instagrapi documentation states that login() uses the CAA flow by default in v3.
+- Current best-practices documentation treats HTTP 429 as throttling related to current IP/request pattern and recommends stopping the burst, backing off, reducing concurrency, and avoiding blind retries.
+- Current instagrapi exposes `login_by_sessionid()` as a lightweight compatibility login path.
+- Current release history shows 3.0.20 as the latest release checked on 2026-10-05, so simply upgrading again is not a credible fix for this specific 429.
+
+### Engineering decision
+- Do NOT solve the 429 by repeatedly calling `login()`, `login_legacy()`, rotating requests rapidly, or shortening the cooldown.
+- The tool now supports an alternate bootstrap path using a Session ID obtained from the user's own already-authenticated Instagram browser session.
+- `IG_SESSIONID = ""` was added as an optional runtime setting; the value must never be committed to GitHub.
+- The tool also checks environment variable `IG_SESSIONID`.
+- If a Session ID is provided, it is tried before password/CAA login.
+- If password/CAA login returns 429, the tool does not retry the password endpoint. It optionally prompts once for a Session ID through hidden `getpass()` input and attempts that alternate path.
+- A successful Session ID login is persisted to the normal Google Drive `ig_tool_session.json` file, so subsequent runs can use the saved instagrapi session.
+- A configured Session ID is also allowed to recover the session while the password-login cooldown is active.
+
+### Important limitation
+- A 429 is imposed by Instagram and cannot be guaranteed to disappear through Python code alone. If Instagram rejects both the CAA login and the supplied Session ID, the remaining issue is the account/IP/session identity rather than the library version.
+- Do not delete a valid saved session and do not repeatedly retry while Instagram is throttling.
+
+### Current validation status
+- Code path reviewed after patch.
+- Static API compatibility remains consistent with instagrapi 3.x: saved sessions use `load_settings(..., override_app_version=True)` and private transport migration to curl when supported.
+- Live authentication is still not testable from this environment because the user's Instagram account and Colab runtime are private.
+
