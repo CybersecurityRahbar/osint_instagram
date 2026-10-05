@@ -9,6 +9,10 @@
 NGROK_AUTH_TOKEN = " توكن انجروك"
 IG_USERNAME = "اسم المستخدم لحسابك"
 IG_PASSWORD = "كلمة المرور "
+# اختياري: Session ID صالح من جلسة Instagram مسجلة الدخول.
+# لا تضعه داخل GitHub. يمكن أيضاً تركه فارغاً؛ عند 429 ستطلب الأداة
+# إدخاله بشكل مخفي من خلال Colab كمسار بديل دون تكرار محاولة كلمة المرور.
+IG_SESSIONID = ""
 TELEGRAM_TOKEN = "توكن تيلجرام"
 TELEGRAM_CHAT_ID = "معرف تلجرام "
 
@@ -638,6 +642,73 @@ class InstagramClient:
         return status, message[:500]
 
     @classmethod
+    def _configure_client(cls, client):
+        """توحيد إعداد عميل Instagram للمسارات الحالية/المحفوظة."""
+        if hasattr(client, "set_retry_config"):
+            client.set_retry_config(private_transport="curl")
+        return client
+
+    @classmethod
+    def _normalize_sessionid(cls, value):
+        value = str(value or "").strip()
+        return value.strip('"').strip("'").strip()
+
+    @classmethod
+    def _get_runtime_sessionid(cls):
+        """
+        أولوية Session ID:
+        1) المتغير داخل Colab (اختياري)
+        2) متغير البيئة IG_SESSIONID
+        """
+        configured = cls._normalize_sessionid(IG_SESSIONID)
+        if configured:
+            return configured
+        return cls._normalize_sessionid(os.environ.get("IG_SESSIONID", ""))
+
+    @classmethod
+    def _activate_sessionid(cls, client, sessionid, source="Session ID"):
+        """محاولة دخول خفيفة باستخدام Session ID موجود مسبقاً."""
+        sessionid = cls._normalize_sessionid(sessionid)
+        if len(sessionid) < 30:
+            return False
+
+        try:
+            print(f"🔑 محاولة الدخول عبر {source}...")
+            cls._configure_client(client)
+            ok = client.login_by_sessionid(sessionid)
+            if ok is False:
+                raise RuntimeError("Instagram لم يقبل Session ID")
+            cls._client = client
+            cls._last_login_failure_at = 0.0
+            cls._last_login_error = ""
+            cls._save_session(force=True)
+            print(f"✅ تم إنشاء جلسة Instagram من {source}")
+            TelegramSender.send_message("✅ *جلسة Instagram نشطة عبر Session ID*")
+            return True
+        except Exception as e:
+            status, message = cls._login_error_details(e)
+            detail = f"HTTP {status}: {message}" if status else message
+            print(f"⚠️ فشل {source}: {detail}")
+            return False
+
+    @classmethod
+    def _prompt_for_sessionid(cls):
+        """
+        عند 429 لا نكرر password/CAA.
+        نطلب Session ID يدويًا فقط كمسار بديل اختياري.
+        """
+        try:
+            from getpass import getpass
+            print("")
+            print("🔐 Instagram ما زال يرفض login() بـ429.")
+            print("   لن نعيد إرسال كلمة المرور مرة أخرى.")
+            print("   يمكنك لصق Session ID صالح من جلسة Instagram مفتوحة في متصفحك.")
+            candidate = getpass("   Session ID (اتركه فارغاً للتخطي): ").strip()
+            return cls._normalize_sessionid(candidate)
+        except Exception:
+            return ""
+
+    @classmethod
     def get_client(cls):
         if cls._client is not None:
             return cls._client
@@ -652,28 +723,39 @@ class InstagramClient:
                     print(f"   السبب السابق: {cls._last_login_error}")
                 return None
 
-        # تحميل cache المستخدمين
         cls._load_user_cache()
-        client = Client()
 
-        # 1) ترحيل/استعادة الجلسة المحفوظة بالطريقة الصحيحة في instagrapi 3.x
+        # 1) الجلسة المحفوظة هي المسار الأول والأكثر أماناً للـrate limit
+        client = None
+        client = cls._configure_client(Client())
+        session_loaded = False
+
         if os.path.exists(cls._SESSION_FILE):
             try:
                 client.load_settings(cls._SESSION_FILE, override_app_version=True)
-                # جلسات قديمة قد تكون محفوظة على requests؛ الإصدار الحالي يوصي بـ curl/HTTP2.
-                if hasattr(client, "set_retry_config"):
-                    client.set_retry_config(private_transport="curl")
+                cls._configure_client(client)
+                session_loaded = True
                 print("♻️ تم تحميل الجلسة المحفوظة مع ترقية ملف app profile")
             except Exception as e:
                 print(f"⚠️ تعذر تحميل الجلسة المحفوظة: {type(e).__name__}: {str(e)[:160]}")
-                client = Client()
-        else:
-            print("ℹ️ لا توجد جلسة محفوظة — سيتم تسجيل دخول واحد فقط")
+                client = cls._configure_client(Client())
 
-        # 2) login() في instagrapi 3.x يتحقق من الجلسة أولاً، ويعيد تسجيل الدخول فقط إذا لزم.
+        # 2) إذا لم توجد جلسة صالحة على Drive، جرّب Session ID الموجود مسبقاً
+        #    قبل إرسال كلمة المرور إلى CAA.
+        if not session_loaded:
+            runtime_sessionid = cls._get_runtime_sessionid()
+            if runtime_sessionid and cls._activate_sessionid(client, runtime_sessionid, "Session ID"):
+                return cls._client
+            if runtime_sessionid:
+                print("⚠️ Session ID المقدم لم يُنشئ جلسة صالحة؛ لنعتبره فاشلاً وننتقل لمسار كلمة المرور.")
+
+        if not session_loaded:
+            print("ℹ️ لا توجد جلسة محفوظة — سيتم تنفيذ محاولة دخول واحدة فقط بكلمة المرور")
+
+        # 3) login() في instagrapi 3.x يتحقق من الجلسة أولاً،
+        #    ثم يستخدم CAA عند الحاجة.
         try:
-            if hasattr(client, "set_retry_config"):
-                client.set_retry_config(private_transport="curl")
+            cls._configure_client(client)
             ok = client.login(IG_USERNAME, IG_PASSWORD)
             if ok is False:
                 raise RuntimeError("Instagram رفض تسجيل الدخول بدون إرجاع جلسة صالحة")
@@ -685,15 +767,33 @@ class InstagramClient:
             print(f"✅ جلسة Instagram نشطة — instagrapi {getattr(instagrapi, '__version__', '?')}")
             TelegramSender.send_message("✅ *جلسة أدوات نشطة*")
             return cls._client
+
         except Exception as e:
             status, message = cls._login_error_details(e)
+            detail = f"HTTP {status}: {message}" if status else message
             cls._last_login_failure_at = time.time()
-            cls._last_login_error = f"HTTP {status}: {message}" if status else message
+            cls._last_login_error = detail
+
             if status == 429 or "429" in message:
-                print("🛑 Instagram أعاد 429 أثناء تسجيل الدخول. لن نعيد المحاولة تلقائياً لتجنب زيادة الحظر المؤقت.")
-                print("   استخدم الجلسة المحفوظة، أو انتظر انتهاء التقييد قبل محاولة دخول جديدة.")
+                print("🛑 Instagram أعاد 429 من CAA أثناء تسجيل الدخول.")
+                print("   هذا تقييد/رفض من Instagram وليس خطأ توافق مكتبة.")
+                print("   لن نكرر password/CAA تلقائياً حتى لا نزيد التقييد.")
+
+                # 4) مسار بديل وحيد: Session ID موجود من جلسة Instagram رسمية.
+                runtime_sessionid = cls._get_runtime_sessionid()
+                if not runtime_sessionid:
+                    runtime_sessionid = cls._prompt_for_sessionid()
+
+                if runtime_sessionid:
+                    alt_client = cls._configure_client(Client())
+                    if cls._activate_sessionid(alt_client, runtime_sessionid, "Session ID بعد 429"):
+                        return cls._client
+
+                print("   إذا فشل Session ID أيضاً، فالمشكلة على مستوى هوية الجلسة/IP لدى Instagram.")
+                print("   لا تحذف أي جلسة محفوظة ناجحة ولا تكرر المحاولة خلال فترة التقييد.")
             else:
-                print(f"❌ فشل تسجيل الدخول: {cls._last_login_error}")
+                print(f"❌ فشل تسجيل الدخول: {detail}")
+
             cls._client = None
             return None
 
