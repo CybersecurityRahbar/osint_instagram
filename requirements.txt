@@ -1,3 +1,0 @@
-# Pin the Instagram client to a known-good version for this project.
-# Do not use an unpinned latest version in Google Colab; upstream API/login flows change.
-instagrapi==3.0.20
