@@ -167,16 +167,26 @@ class TelegramSender:
     def send_photo(photo_path, caption="", reply_markup=None):
         try:
             with open(photo_path, "rb") as f:
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption[:1024],
+                    "parse_mode": "HTML",
+                    "show_caption_above_media": "true",
+                }
+                if reply_markup:
+                    payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
                 r = _http_session.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "caption": caption[:1024],
-                        "parse_mode": "HTML",
-                        "show_caption_above_media": "true",
-                        **({"reply_markup": json.dumps(reply_markup, ensure_ascii=False)} if reply_markup else {}),
-                    },
-                    files={"photo": f}, timeout=30)
+                    data=payload, files={"photo": f}, timeout=30)
+                if r.status_code == 200:
+                    return True
+
+                # بعض العملاء/الحسابات قد لا تقبل بعض عناصر Rich formatting
+                # داخل caption؛ نعيدها كنص HTML بسيط فقط في هذه الحالة.
+                payload["caption"] = TelegramSender._strip_rich_html(caption)[:1024]
+                r = _http_session.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                    data=payload, files={"photo": f}, timeout=30)
                 return r.status_code == 200
         except Exception as e:
             print(f"⚠️ صورة: {e}")
@@ -186,17 +196,25 @@ class TelegramSender:
     def send_video(video_path, caption="", reply_markup=None):
         try:
             with open(video_path, "rb") as f:
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption[:1024],
+                    "parse_mode": "HTML",
+                    "show_caption_above_media": "true",
+                    "supports_streaming": "true",
+                }
+                if reply_markup:
+                    payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
                 r = _http_session.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "caption": caption[:1024],
-                        "parse_mode": "HTML",
-                        "show_caption_above_media": "true",
-                        "supports_streaming": "true",
-                        **({"reply_markup": json.dumps(reply_markup, ensure_ascii=False)} if reply_markup else {}),
-                    },
-                    files={"video": f}, timeout=90)
+                    data=payload, files={"video": f}, timeout=90)
+                if r.status_code == 200:
+                    return True
+
+                payload["caption"] = TelegramSender._strip_rich_html(caption)[:1024]
+                r = _http_session.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo",
+                    data=payload, files={"video": f}, timeout=90)
                 return r.status_code == 200
         except Exception as e:
             print(f"⚠️ فيديو: {e}")
@@ -1715,7 +1733,12 @@ class InstagramSearcher:
                 if not end_cursor: break
                 time.sleep(random.uniform(0.3, 0.6))
             except Exception as e:
-                print(f"   ⚠️ traversal: {e}"); break
+                if InstagramClient._is_rate_limit_error(e):
+                    InstagramClient._mark_throttle(e)
+                    print("   🛑 traversal توقف بسبب 429؛ الجلسة محفوظة.")
+                else:
+                    print(f"   ⚠️ traversal: {type(e).__name__}: {str(e)[:120]}")
+                break
         print(f"   ✅ traversal: {len(all_items)} / {page} صفحة / {time.time()-t0:.1f}ث")
         return all_items
 
@@ -2295,7 +2318,12 @@ class InstagramSearcher:
                     fl = self.client.user_followers(uid, amount=max_followers)
                     for f in fl.values(): save_follower(account_id, f)
                     TelegramSender.send_message(f"👥 {len(fl)} متابع")
-                except Exception as fe: print(f"⚠️ متابعين: {fe}")
+                except Exception as fe:
+                    if InstagramClient._is_rate_limit_error(fe):
+                        InstagramClient._mark_throttle(fe)
+                        print("🛑 جلب المتابعين توقف بسبب 429؛ الجلسة محفوظة.")
+                    else:
+                        print(f"⚠️ متابعين: {type(fe).__name__}: {str(fe)[:120]}")
 
             if fetch_stories:
                 print("📖 جلب القصص...")
@@ -2312,14 +2340,28 @@ class InstagramSearcher:
 
             InstagramClient._save_session(force=True)
             TelegramSender.send_rich_message(
-                f"<b>✅ اكتملت المهمة</b>\n"
+                f"<b>✅ انتهت المهمة</b>\n"
                 f"👤 @{html_escape(username.lstrip('@'))}\n"
-                f"📦 المطلوب: <b>{len(targets) if targets else 0}</b>\n"
-                f"💾 تم حفظ النتائج والوسائط في Google Drive."
+                f"📦 المحدد: <b>{len(targets) if targets else 0}</b>\n"
+                f"✅ نُزّل بنجاح: <b>{successful if targets else 0}</b>\n"
+                f"💾 النتائج والوسائط محفوظة في Google Drive."
             )
         except Exception as e:
-            print(f"❌ {e}"); traceback.print_exc()
-            TelegramSender.send_message(f"❌ {e}")
+            if InstagramClient._is_rate_limit_error(e):
+                InstagramClient._mark_throttle(e)
+                print("🛑 توقفت المهمة بسبب 429 من Instagram.")
+                print("   الجلسة لم تنتهِ؛ تم حفظها وإيقاف الطلبات مؤقتاً.")
+                TelegramSender.send_message(
+                    f"🛑 <b>Instagram فرض تهدئة مؤقتة</b>\n"
+                    f"الجلسة محفوظة ولم يتم تسجيل الخروج.\n"
+                    f"⏳ التهدئة: {InstagramClient.throttle_remaining()} ثانية.",
+                )
+            else:
+                print(f"❌ {type(e).__name__}: {str(e)[:250]}")
+                traceback.print_exc()
+                TelegramSender.send_message(
+                    f"❌ {type(e).__name__}: {html_escape(str(e)[:500])}"
+                )
 
     def _csv_report(self, username):
         try:
