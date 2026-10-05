@@ -28,3 +28,13 @@ HTTP 429 from Instagram is a server-side throttle. The tool does not blindly ret
 ## Project context
 
 See PROJECT_CONTEXT.md for the cumulative investigation log and engineering decisions.
+
+## Media and Telegram output
+
+- Normal profile scraping uses authenticated `user_medias()` and avoids the separate clips endpoint.
+- Instagram media is downloaded with instagrapi's native media download helpers before being sent to Telegram.
+- Failed media remain retryable on later runs.
+- Telegram output uses numbered HTML captions, caption-above-media, inline buttons, and Bot API Rich Messages where available.
+- Profile retrieval sends the profile picture together with account statistics and public profile details.
+- HTTP 429 is treated as a temporary Instagram throttle, not automatic logout; the session is preserved.
+
