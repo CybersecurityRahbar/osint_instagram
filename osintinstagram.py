@@ -9,8 +9,11 @@
 NGROK_AUTH_TOKEN = " توكن انجروك"
 IG_USERNAME = "اسم المستخدم لحسابك"
 IG_PASSWORD = "كلمة المرور "
-# ملاحظة أمنية: لا تستخدم sessionid من متصفح شخصي.
-# Instagram قد يعتبر نسخ جلسة المتصفح إلى بيئة Colab جلسة/جهازاً غير موثوق.
+
+# مسار المصادقة الافتراضي: محاكاة مسار login القديم داخل instagrapi 3.x.
+# لا تستخدم Session ID المنسوخ من متصفح شخصي.
+LOGIN_STRATEGY = "legacy_first"
+PRIVATE_TRANSPORT_FOR_LOGIN = "requests"
 TELEGRAM_TOKEN = "توكن تيلجرام"
 TELEGRAM_CHAT_ID = "معرف تلجرام "
 
@@ -416,7 +419,8 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
         post_code TEXT UNIQUE, post_url TEXT, media_type TEXT, caption TEXT,
-        like_count INTEGER, comment_count INTEGER, taken_at DATETIME,
+        like_count INTEGER, comment_count INTEGER, view_count INTEGER DEFAULT 0,
+        play_count INTEGER DEFAULT 0, taken_at DATETIME,
         file_path TEXT, downloaded BOOLEAN DEFAULT 0,
         thumbnail_url TEXT,
         FOREIGN KEY(account_id) REFERENCES accounts(id))''')
@@ -464,6 +468,14 @@ def init_db():
     conn.commit()
     
     # Migration
+    post_cols = _table_columns(c, 'posts')
+    if 'view_count' not in post_cols:
+        c.execute("ALTER TABLE posts ADD COLUMN view_count INTEGER DEFAULT 0")
+        print("🔧 Migration: أضيف view_count لـ posts")
+    if 'play_count' not in post_cols:
+        c.execute("ALTER TABLE posts ADD COLUMN play_count INTEGER DEFAULT 0")
+        print("🔧 Migration: أضيف play_count لـ posts")
+
     for table in ['posts', 'stories']:
         cols = _table_columns(c, table)
         if 'thumbnail_url' not in cols:
@@ -511,24 +523,38 @@ def save_post_if_not_exists(account_username, media, media_type=None, file_path=
     existing = c.fetchone()
     if existing:
         post_id = existing[0]
-        if media_type or file_path:
-            c.execute(
-                "UPDATE posts SET media_type=COALESCE(?, media_type), "
-                "file_path=COALESCE(?, file_path), "
-                "downloaded=CASE WHEN ? IS NOT NULL THEN 1 ELSE downloaded END "
-                "WHERE id=?",
-                (media_type, file_path, file_path, post_id)
+        c.execute(
+            "UPDATE posts SET "
+            "media_type=COALESCE(?, media_type), "
+            "file_path=COALESCE(?, file_path), "
+            "downloaded=CASE WHEN ? IS NOT NULL THEN 1 ELSE downloaded END, "
+            "like_count=?, comment_count=?, view_count=?, play_count=?, thumbnail_url=COALESCE(?, thumbnail_url) "
+            "WHERE id=?",
+            (
+                media_type, file_path, file_path,
+                int(getattr(media, "like_count", 0) or 0),
+                int(getattr(media, "comment_count", 0) or 0),
+                int(getattr(media, "view_count", 0) or 0),
+                int(getattr(media, "play_count", 0) or 0),
+                str(getattr(media, "thumbnail_url", "") or "") or None,
+                post_id
             )
+        )
             conn.commit()
         conn.close()
         return post_id
 
     thumb_url = str(getattr(media, 'thumbnail_url', '') or '')
     c.execute('''INSERT INTO posts (account_id, post_code, post_url, media_type,
-        caption, like_count, comment_count, taken_at, file_path, downloaded, thumbnail_url)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+        caption, like_count, comment_count, view_count, play_count, taken_at,
+        file_path, downloaded, thumbnail_url)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
         (account_id, media.code, f"https://www.instagram.com/p/{media.code}/",
-         media_type, media.caption_text or "", media.like_count, media.comment_count,
+         media_type, media.caption_text or "",
+         int(getattr(media, "like_count", 0) or 0),
+         int(getattr(media, "comment_count", 0) or 0),
+         int(getattr(media, "view_count", 0) or 0),
+         int(getattr(media, "play_count", 0) or 0),
          media.taken_at.isoformat(), file_path, 1 if file_path else 0, thumb_url))
     post_id = c.lastrowid
     conn.commit(); conn.close()
@@ -832,10 +858,21 @@ class InstagramClient:
         return cls._last_challenge_error or "Instagram طلب تحقق أمني يدوي."
 
     @classmethod
-    def _configure_client(cls, client):
-        """توحيد إعداد عميل Instagram للمسارات الحالية/المحفوظة."""
+    def _configure_client(cls, client, legacy=False):
+        """توحيد إعداد عميل Instagram مع إمكانية تشغيل المسار القديم."""
         if hasattr(client, "set_retry_config"):
-            client.set_retry_config(private_transport="curl")
+            kwargs = {
+                "public_request_retries_count": 1,
+                "public_request_retries_timeout": 2,
+                "session_retry_total": 1,
+                "session_retry_backoff_factor": 1,
+                "session_retry_statuses": [429, 500, 502, 503, 504],
+            }
+            if legacy:
+                kwargs["private_transport"] = PRIVATE_TRANSPORT_FOR_LOGIN
+            else:
+                kwargs["private_transport"] = "curl"
+            client.set_retry_config(**kwargs)
         return client
 
     @classmethod
@@ -875,7 +912,7 @@ class InstagramClient:
                 session_elapsed = time.time() - cls._last_sessionid_failure_at if cls._last_sessionid_failure_at else float("inf")
                 if runtime_sessionid and session_elapsed >= cls._SESSIONID_COOLDOWN_SECONDS:
                     try:
-                        session_client = cls._configure_client(Client())
+                        session_client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY == "legacy_first"))
                         if cls._activate_sessionid(session_client, runtime_sessionid, "Session ID أثناء cooldown"):
                             return cls._client
                     except Exception:
@@ -891,7 +928,7 @@ class InstagramClient:
 
         # 1) الجلسة المحفوظة هي المسار الأول والأكثر أماناً للـrate limit
         client = None
-        client = cls._configure_client(Client())
+        client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY == "legacy_first"))
         session_loaded = False
 
         if os.path.exists(cls._SESSION_FILE):
@@ -924,7 +961,7 @@ class InstagramClient:
                         print(f"⚠️ تعذر التحقق من الجلسة المحفوظة: {type(session_check_error).__name__}: {str(session_check_error)[:160]}")
             except Exception as e:
                 print(f"⚠️ تعذر تحميل الجلسة المحفوظة: {type(e).__name__}: {str(e)[:160]}")
-                client = cls._configure_client(Client())
+                client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY == "legacy_first"))
 
         if not session_loaded:
             print("ℹ️ لا توجد جلسة محفوظة — سيتم تنفيذ محاولة دخول واحدة فقط بكلمة المرور")
@@ -933,7 +970,10 @@ class InstagramClient:
         #    أو تحتاج الجلسة إلى إعادة مصادقة.
         try:
             cls._configure_client(client)
-            ok = client.login(IG_USERNAME, IG_PASSWORD)
+            if LOGIN_STRATEGY == "legacy_first" and hasattr(client, "login_legacy"):
+                ok = client.login_legacy(IG_USERNAME, IG_PASSWORD)
+            else:
+                ok = client.login(IG_USERNAME, IG_PASSWORD)
             if ok is False:
                 raise RuntimeError("Instagram رفض تسجيل الدخول بدون إرجاع جلسة صالحة")
 
@@ -1018,7 +1058,10 @@ class InstagramClient:
 
             if "login_required" in lower:
                 try:
-                    ok = cls._client.login(IG_USERNAME, IG_PASSWORD)
+                    if LOGIN_STRATEGY == "legacy_first" and hasattr(cls._client, "login_legacy"):
+                        ok = cls._client.login_legacy(IG_USERNAME, IG_PASSWORD, relogin=True)
+                    else:
+                        ok = cls._client.login(IG_USERNAME, IG_PASSWORD, relogin=True)
                     if ok is False:
                         return False
                     cls._last_session_validation_at = time.time()
@@ -1789,9 +1832,10 @@ class InstagramSearcher:
         if not InstagramClient.refresh_if_needed():
             return []
         strategies = [
-            ("reels_media", lambda: self._fetch_stories_via_reels_media(user_id)),
-            ("user_stories", lambda: self.client.user_stories(user_id, amount=max_stories)),
+            ("user_stories_v1", lambda: self.client.user_stories_v1(user_id, amount=max_stories))
         ]
+        if not hasattr(self.client, "user_stories_v1"):
+            strategies.append(("user_stories", lambda: self.client.user_stories(user_id, amount=max_stories)))
         for name, func in strategies:
             try:
                 stories = func()
@@ -1845,18 +1889,24 @@ class InstagramSearcher:
                 file_path = os.path.join(story_folder, f"story_{pk}.{ext}")
                 downloaded_ok = False
                 try:
-                    r = _http_session.get(story_url, timeout=60, stream=True)
-                    if r.status_code == 200:
-                        with open(file_path, "wb") as f:
-                            for chunk in r.iter_content(8192): f.write(chunk)
-                        downloaded_ok = True
-                        
-                        # 🎨 تحميل thumbnail محلياً للفيديو (مرة واحدة فقط!)
-                        if media_kind == 'video':
-                            thumb_url = str(getattr(story, 'thumbnail_url', '') or '')
-                            if thumb_url:
-                                ThumbnailEngine.from_url_to_file(thumb_url, file_path)
-                except Exception as de: print(f"      ⚠️ تحميل: {de}")
+                    if hasattr(self.client, "story_download"):
+                        native_path = self.client.story_download(
+                            pk, filename=os.path.basename(file_path), folder=story_folder
+                        )
+                        if native_path and os.path.exists(native_path):
+                            file_path = os.fspath(native_path)
+                            downloaded_ok = True
+                    elif hasattr(self.client, "story_download_by_url"):
+                        native_path = self.client.story_download_by_url(
+                            str(story_url), os.path.basename(file_path), story_folder
+                        )
+                        if native_path and os.path.exists(native_path):
+                            file_path = os.fspath(native_path)
+                            downloaded_ok = True
+                except Exception as de:
+                    if InstagramClient._is_rate_limit_error(de):
+                        InstagramClient._mark_throttle(de)
+                    print(f"      ⚠️ تنزيل Story: {type(de).__name__}: {str(de)[:120]}")
 
                 if downloaded_ok:
                     save_story(account_id, story, file_path, story_url)
@@ -1879,9 +1929,12 @@ class InstagramSearcher:
 
             print(f"📌 جلب الـ Highlights لـ @{username}...")
             try:
-                highlights = self.client.user_highlights(uid, amount=max_highlights)
+                if hasattr(self.client, "user_highlights_v1"):
+                    highlights = self.client.user_highlights_v1(uid, amount=max_highlights)
+                else:
+                    highlights = self.client.user_highlights(uid, amount=max_highlights)
             except Exception as he:
-                print(f"   ⚠️ user_highlights فشل: {type(he).__name__}")
+                print(f"   ⚠️ user_highlights فشل: {type(he).__name__}: {str(he)[:100]}")
                 return 0
 
             if not highlights: return 0
@@ -1904,8 +1957,48 @@ class InstagramSearcher:
                 
                 cover_path = ""
                 hl_id = save_highlight(account_id, hl, cover_url, cover_path)
-                if not hl_id: continue
+                if not hl_id:
+                    continue
+
+                # 3.x يعيد عناصر الـHighlight نفسها داخل hl.items عبر v1.
+                items = list(getattr(hl, "items", []) or [])[:max_items_per_hl]
+                for item in items:
+                    try:
+                        item_pk = str(getattr(item, "pk", "") or "")
+                        if not item_pk:
+                            continue
+                        item_folder = os.path.join(folder, str(getattr(hl, "pk", "")))
+                        os.makedirs(item_folder, exist_ok=True)
+                        if hasattr(self.client, "story_download"):
+                            item_path = self.client.story_download(
+                                item_pk, folder=item_folder, overwrite=True
+                            )
+                        elif hasattr(self.client, "story_download_by_url"):
+                            item_url = getattr(item, "video_url", None) or getattr(item, "thumbnail_url", None)
+                            if not item_url:
+                                continue
+                            item_path = self.client.story_download_by_url(
+                                str(item_url), f"highlight_{item_pk}", item_folder
+                            )
+                        else:
+                            continue
+                        if item_path and os.path.exists(item_path):
+                            save_highlight_item(
+                                hl_id, item, os.fspath(item_path),
+                                str(getattr(item, "video_url", "") or "")
+                            )
+                    except Exception as ie:
+                        if InstagramClient._is_rate_limit_error(ie):
+                            InstagramClient._mark_throttle(ie)
+                            break
+                        print(f"      ⚠️ Highlight item: {type(ie).__name__}: {str(ie)[:100]}")
+
+                    if InstagramClient.is_throttled():
+                        break
+
                 total_highlights += 1
+                if InstagramClient.is_throttled():
+                    break
                 InstagramClient.human_delay(1, 2)
 
             print(f"✅ النتيجة: {total_highlights} Highlights")
@@ -2290,9 +2383,21 @@ class InstagramSearcher:
 
             if fetch_followers and account_id:
                 try:
-                    fl = self.client.user_followers(uid, amount=max_followers)
-                    for f in fl.values(): save_follower(account_id, f)
-                    TelegramSender.send_message(f"👥 {len(fl)} متابع")
+                    if hasattr(self.client, "user_followers_v1"):
+                        fl = self.client.user_followers_v1(uid, amount=max_followers)
+                    else:
+                        fl = list(self.client.user_followers(uid, amount=max_followers).values())
+                    for follower in fl[:max_followers]:
+                        save_follower(account_id, follower)
+                    follower_preview = "\n".join(
+                        f"{i:03d}. @{getattr(follower, 'username', '')} — {getattr(follower, 'full_name', '')}".strip()
+                        for i, follower in enumerate(fl[:max_followers], 1)
+                    )
+                    TelegramSender.send_rich_message(
+                        f"<b>👥 المتابعون — {html_escape(username)}</b>\n"
+                        f"📦 تم جلب: <b>{len(fl[:max_followers])}</b>\n\n"
+                        f"<blockquote>{html_escape(follower_preview[:3000])}</blockquote>"
+                    )
                 except Exception as fe:
                     if "challenge" in str(fe).lower() or "manual verification" in str(fe).lower():
                         InstagramClient._mark_challenge(fe)
