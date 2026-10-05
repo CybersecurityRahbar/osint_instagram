@@ -174,3 +174,52 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Current session validation now targets `account_info()`.
 - Live Colab execution is still the final required validation step because the actual Instagram session is private.
 
+## 2026-10-05 — Media completeness, session resilience, direct-profile lookup, and Telegram modernization
+
+### User runtime evidence
+- Instagram authentication now succeeds through the saved Session ID.
+- The profile task selected the requested 10 publications, but only four video files reached Telegram; several image/video downloads failed with `TooManyRedirects`.
+- The same first task later produced HTTP 429 during a session validation call.
+- A second task was perceived as having an ended session because the previous code treated that 429 as a disconnected/invalid session.
+- The direct profile workflow also logged `search_users: TypeError`, despite the user not using the explicit Search tab.
+
+### Root causes
+1. Media downloading used raw `requests.get()` against Instagram CDN URLs. This can fail with redirect churn and bypasses the downloader logic shipped with instagrapi.
+2. The code used `ThreadPoolExecutor` to download multiple Instagram media objects concurrently, increasing burstiness and request pressure.
+3. `save_post_if_not_exists()` returned no ID when a post already existed. A post whose database row was created before a failed download could therefore be skipped forever on later runs.
+4. The session validation path made a network `account_info()` request too frequently. A 429 from that validation was incorrectly recorded as a login failure.
+5. Direct username lookup unnecessarily used `search_users()`. In instagrapi 3.x the method signature is `search_users(query)`, so passing a count caused the observed TypeError; moreover, Search is unnecessary for a direct username target.
+6. The explicit Universal Search helpers still used old count arguments for `search_users`, `search_hashtags`, `search_reels`, and `search_music`.
+
+### Engineering changes
+- Normal profile scraping now uses `user_medias()` as the primary feed source and no longer calls `user_clips()` in the normal Smart Merge path. This avoids the observed `clips: login_required` request and reduces API volume. instagrapi documentation describes `user_medias()` as the user's feed media and includes photo/video/album media types.
+- Media download now uses instagrapi's native `photo_download()`, `video_download()`, and `album_download()` helpers, with a single `*_download_by_url()` fallback.
+- Instagram media downloads are now sequential rather than concurrent.
+- Existing database post rows can now be reprocessed, so a previous failed download can be retried and completed later.
+- Post delivery to Telegram is numbered `#01 / N`, includes metadata, an Instagram link button, and uses HTML captions with caption-above-media.
+- Profile cards now use `user_info_by_username()` directly, include profile photo plus public account statistics, verification/privacy/account type/category/external URL when available, and are sent as modern Telegram content.
+- The tool now supports Telegram Rich Messages through Bot API `sendRichMessage`, with an HTML fallback to `sendMessage`.
+- Telegram media messages use the current `show_caption_above_media` option and inline URL buttons.
+- 429 handling is now a separate throttle state. A 429 does not clear the client, does not mark the session as logged out, and causes the current task to stop safely until the cooldown expires.
+- Session validation is cached for 10 minutes and is skipped during an active 429 cooldown.
+- The current task saves the session before entering the 429 cooldown.
+- Explicit Search helpers were updated to call current one-argument search methods and slice the returned results locally.
+
+### Telegram current-version verification
+- Telegram Bot API 10.1 introduced Rich Messages on June 11, 2026.
+- Bot API 10.2 expanded Rich Messages with structured blocks and media support on July 14, 2026.
+- Bot API 10.3 on August 24, 2026 added expandable block quotations and additional Rich Message features.
+- The project therefore now targets the current Telegram Bot API capabilities available through raw HTTPS calls without requiring a Telegram Python SDK.
+
+### Validation status
+- Static verification after this patch confirms:
+  - direct profile flow no longer calls `search_users()`;
+  - obsolete `user_timeline()` call is absent;
+  - normal Smart Merge no longer invokes `user_clips()`;
+  - native media download helpers are present;
+  - concurrent media download block is absent from the processing path;
+  - existing post rows are retryable;
+  - 429 has a dedicated throttle state separate from login failure;
+  - Telegram Rich Message endpoint and caption-above-media support are present.
+- Live Colab validation remains the final test for actual Instagram CDN downloads, media completeness, and Telegram rendering.
+
