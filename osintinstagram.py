@@ -1,5 +1,5 @@
 #============================================================
-# 🕵️ Instagram OSINT Scraper ULTRA v2 — مصحّح ومحسّن
+# 🕵️ Instagram OSINT Scraper ULTRA v2.1 — session migration fixed
 # ✅ Cache ذكي + Fallback methods + LRU Cache للصور
 # ============================================================
 
@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from flask import Flask, request, render_template_string
 from pyngrok import ngrok
+import instagrapi
 from instagrapi import Client
 
 try:
@@ -297,7 +298,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS stories (
         id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
         story_pk TEXT UNIQUE, media_type TEXT, taken_at DATETIME,
-        file_path TEXT, downloaded BOOLEAN DEFAULT 0,
+        file_path TEXT, story_url TEXT, downloaded BOOLEAN DEFAULT 0,
         thumbnail_url TEXT,
         FOREIGN KEY(account_id) REFERENCES accounts(id))''')
     
@@ -332,6 +333,11 @@ def init_db():
         if 'thumbnail_url' not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN thumbnail_url TEXT")
             print(f"🔧 Migration: أضيف thumbnail_url لـ {table}")
+    # إصلاح قاعدة بيانات قديمة لم يكن فيها story_url رغم أن save_story يستخدمه.
+    story_cols = _table_columns(c, 'stories')
+    if 'story_url' not in story_cols:
+        c.execute("ALTER TABLE stories ADD COLUMN story_url TEXT")
+        print("🔧 Migration: أضيف story_url لـ stories")
     
     conn.commit(); conn.close()
     print("✅ قاعدة البيانات جاهزة")
@@ -513,6 +519,9 @@ def save_mention(query, source_type, source_pk, source_url, context,
 class InstagramClient:
     _client = None
     _save_counter = 0
+    _last_login_failure_at = 0.0
+    _last_login_error = ""
+    _LOGIN_COOLDOWN_SECONDS = 900
     _SESSION_FILE = ("/content/drive/MyDrive/ig_tool_session.json" if IN_COLAB
                      else "ig_tool_session.json")
     
@@ -593,39 +602,72 @@ class InstagramClient:
             client.load_settings(tmp)
 
     @classmethod
+    def _login_error_details(cls, exc):
+        """إرجاع تفاصيل آمنة للخطأ بدون تسريب كلمة المرور أو الأسرار."""
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        message = str(exc).strip() or type(exc).__name__
+        return status, message[:500]
+
+    @classmethod
     def get_client(cls):
-        if cls._client is not None: return cls._client
-        
+        if cls._client is not None:
+            return cls._client
+
+        # منع إعادة ضرب endpoint تسجيل الدخول أثناء فترة 429/الرفض المؤقت
+        if cls._last_login_failure_at:
+            elapsed = time.time() - cls._last_login_failure_at
+            if elapsed < cls._LOGIN_COOLDOWN_SECONDS:
+                remaining = int(cls._LOGIN_COOLDOWN_SECONDS - elapsed)
+                print(f"⏳ آخر محاولة دخول فشلت. لن نكرر تسجيل الدخول الآن؛ المتبقي تقريباً {remaining}s")
+                if cls._last_login_error:
+                    print(f"   السبب السابق: {cls._last_login_error}")
+                return None
+
         # تحميل cache المستخدمين
         cls._load_user_cache()
-        
-        cls._client = Client()
+        client = Client()
+
+        # 1) ترحيل/استعادة الجلسة المحفوظة بالطريقة الصحيحة في instagrapi 3.x
         if os.path.exists(cls._SESSION_FILE):
             try:
-                with open(cls._SESSION_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-        # ⭐ الإصلاح: استخدام override_app_version=True
-                cls._client.set_settings(saved, override_app_version=True)
-                cls._client.user_id
-                print("✅ جلسة مستعادة (تم تحديث نسخة التطبيق)")
-                cls._save_session(force=True)
-                return cls._client
+                client.load_settings(cls._SESSION_FILE, override_app_version=True)
+                # جلسات قديمة قد تكون محفوظة على requests؛ الإصدار الحالي يوصي بـ curl/HTTP2.
+                if hasattr(client, "set_retry_config"):
+                    client.set_retry_config(private_transport="curl")
+                print("♻️ تم تحميل الجلسة المحفوظة مع ترقية ملف app profile")
             except Exception as e:
-                print(f"⚠️ جلسة قديمة: {e}")
-                cls._client = Client()
-        # ⭐ إعادة تعيين النسخة بعد إعادة إنشاء الـ client
+                print(f"⚠️ تعذر تحميل الجلسة المحفوظة: {type(e).__name__}: {str(e)[:160]}")
+                client = Client()
+        else:
+            print("ℹ️ لا توجد جلسة محفوظة — سيتم تسجيل دخول واحد فقط")
+
+        # 2) login() في instagrapi 3.x يتحقق من الجلسة أولاً، ويعيد تسجيل الدخول فقط إذا لزم.
         try:
-            cls._client.set_app_version("345.0.0.38.107")
-        except Exception as e:
-            print(f"⚠️ تعيين النسخة فشل: {e}")
-        try:
-            cls._client.login(IG_USERNAME, IG_PASSWORD)
+            if hasattr(client, "set_retry_config"):
+                client.set_retry_config(private_transport="curl")
+            ok = client.login(IG_USERNAME, IG_PASSWORD)
+            if ok is False:
+                raise RuntimeError("Instagram رفض تسجيل الدخول بدون إرجاع جلسة صالحة")
+
+            cls._client = client
+            cls._last_login_failure_at = 0.0
+            cls._last_login_error = ""
             cls._save_session(force=True)
-            print("✅ جلسة جديدة")
+            print(f"✅ جلسة Instagram نشطة — instagrapi {getattr(instagrapi, '__version__', '?')}")
             TelegramSender.send_message("✅ *جلسة أدوات نشطة*")
+            return cls._client
         except Exception as e:
-            print(f"❌ فشل: {e}"); cls._client = None; return None
-        return cls._client
+            status, message = cls._login_error_details(e)
+            cls._last_login_failure_at = time.time()
+            cls._last_login_error = f"HTTP {status}: {message}" if status else message
+            if status == 429 or "429" in message:
+                print("🛑 Instagram أعاد 429 أثناء تسجيل الدخول. لن نعيد المحاولة تلقائياً لتجنب زيادة الحظر المؤقت.")
+                print("   استخدم الجلسة المحفوظة، أو انتظر انتهاء التقييد قبل محاولة دخول جديدة.")
+            else:
+                print(f"❌ فشل تسجيل الدخول: {cls._last_login_error}")
+            cls._client = None
+            return None
 
     @classmethod
     def _save_session(cls, force=False):
@@ -641,16 +683,33 @@ class InstagramClient:
 
     @classmethod
     def refresh_if_needed(cls):
-        if cls._client is None: return False
+        if cls._client is None:
+            return False
         try:
-            cls._client.user_timeline(amount=1); return True
+            cls._client.user_timeline(amount=1)
+            return True
         except Exception as e:
-            if "login_required" in str(e) or "challenge_required" in str(e):
+            status, message = cls._login_error_details(e)
+            lower = message.lower()
+            if status == 429 or "429" in lower:
+                print("🛑 429 أثناء التحقق من الجلسة؛ لن نحاول login() تلقائياً الآن.")
+                cls._last_login_failure_at = time.time()
+                cls._last_login_error = f"HTTP {status}: {message}" if status else message
+                return False
+            if "login_required" in lower or "challenge_required" in lower:
                 try:
-                    cls._client.login(IG_USERNAME, IG_PASSWORD)
-                    cls._save_session(force=True); return True
-                except: return False
-        return True
+                    ok = cls._client.login(IG_USERNAME, IG_PASSWORD)
+                    if ok is False:
+                        return False
+                    cls._save_session(force=True)
+                    return True
+                except Exception as relogin_exc:
+                    status2, message2 = cls._login_error_details(relogin_exc)
+                    cls._last_login_failure_at = time.time()
+                    cls._last_login_error = f"HTTP {status2}: {message2}" if status2 else message2
+                    return False
+            print(f"⚠️ فشل التحقق من جلسة Instagram: {type(e).__name__}: {message}")
+            return False
 
     @classmethod
     def human_delay(cls, a=1.5, b=4):
@@ -1300,7 +1359,8 @@ class InstagramSearcher:
     def __init__(self):
         self.client = InstagramClient.get_client()
         if self.client is None:
-            raise Exception("فشل الحصول على عميل انستغرام")
+            reason = InstagramClient._last_login_error or "لا توجد جلسة صالحة أو فشل تسجيل الدخول"
+            raise RuntimeError(f"فشل الحصول على عميل انستغرام: {reason}")
         self.universal_searcher = UniversalSearcher(self.client)
 
     def _fast_cursor_traverse(self, fetch_func, user_id, max_total):
@@ -2389,6 +2449,7 @@ if NGROK_AUTH_TOKEN and not NGROK_AUTH_TOKEN.startswith("ضع_"):
     print("✅ ngrok")
 
 init_db()
+print(f"📦 instagrapi version: {getattr(instagrapi, '__version__', '?')}")
 print("🔐 تهيئة الجلسة...")
 InstagramClient.get_client()
 
