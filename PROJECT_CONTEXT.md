@@ -250,3 +250,50 @@ Do not delete the existing Drive session before testing. First restart/clean the
 ### Immediate account-protection action
 - The affected personal Instagram account should be secured through Instagram's official recovery/security UI before any more automation is attempted. Do not reuse the browser Session ID in Colab.
 
+## 2026-10-05 — Rebuild around the proven legacy password-login architecture
+
+### User requirement reaffirmed
+- The user confirms the original password/username version previously fetched profile data, posts/photos, videos, Stories, Highlights, comments, likes, views, and a requested follower sample (for example 100 names).
+- The old implementation remains in Git history and is the baseline evidence that these features worked together in a real Colab session.
+- The objective is therefore compatibility repair and architecture preservation, not declaring the feature set impossible.
+
+### Upstream 3.0.20 capabilities verified
+- `Client.login_legacy()` is an official entry point that explicitly selects the previous Instagram login flow.
+- The v3 code supports selecting `private_transport="requests"` for compatibility with the previous private transport.
+- Private Mobile API helpers exist for `user_stories_v1()`, `user_followers_v1()`, and `user_highlights_v1()`.
+- Highlight extraction in 3.0.20 includes its story items.
+- Native media download helpers include `photo_download()`, `video_download()`, `album_download()`, and `story_download()`.
+- Media objects expose `like_count`, `comment_count`, `view_count`, and `play_count`.
+
+### Implementation changes
+- The project now sets `LOGIN_STRATEGY = "legacy_first"`.
+- Fresh password authentication now uses `login_legacy(username, password)` when available.
+- The tool uses `private_transport="requests"` for the legacy strategy, including saved sessions, so the authentication/data path stays internally consistent.
+- The old browser Session ID bootstrap remains disabled.
+- A new tool-owned session file is used:
+  `/content/drive/MyDrive/ig_tool_session_legacy_v3.json`
+  This intentionally avoids reusing the previously cloned browser-session file.
+- Direct username resolution now prefers `user_info_by_username_v1()` and stays inside private API paths.
+- Stories prefer `user_stories_v1()` and use native `story_download()`.
+- Followers prefer `user_followers_v1()`; the requested number is saved and sent to Telegram in numbered chunks of 20.
+- Highlights prefer `user_highlights_v1()`, and the returned highlight `items` are downloaded and stored.
+- Comments prefer `media_comments_v1()`.
+- Media records store view/play counts in SQLite and Telegram/HTML output.
+- Existing follower records are migrated from global `username UNIQUE` to composite `UNIQUE(account_id, username)`.
+- Existing media DB rows remain retryable after failed downloads.
+- Normal profile media collection uses `user_medias()`; the separate clips endpoint is not used in normal scraping.
+
+### Concurrency decision
+- The original user workflow used aggressive parallelism and was capable of very high-volume scraping.
+- The current implementation intentionally does not restore 10 simultaneous Instagram requests. The observed 429/Challenge account events show that server-side anti-abuse is now sensitive to burst patterns.
+- Controlled Instagram request sequencing is used for reliability. Local file/Telegram work can be optimized separately without multiplying private API requests.
+
+### Expected authentication model
+- First run: username/password → legacy private login → save tool-owned session.
+- Later runs: load the same saved settings → validate with `account_info()` only when needed → reuse session without fresh login.
+- 429 or ChallengeRequired: stop the affected task and preserve the session; do not attempt to evade the challenge.
+
+### Validation status
+- Static source review completed for login strategy, private v1 story/follower/highlight paths, native story/media download, view/play metrics, follower DB migration, and legacy-session isolation.
+- Live authentication/data collection still requires testing by the user in Colab with an authorized account after the account-security warning is fully resolved.
+
