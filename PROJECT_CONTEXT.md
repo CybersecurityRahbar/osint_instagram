@@ -490,3 +490,11 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - The browser stores the token only in localStorage; it is not written to Google Drive or GitHub.
 - `/`, `/health`, and `/favicon.ico` remain public so the panel can load and the browser does not create unnecessary authenticated noise.
 - The new token does not create background polling; status remains manual.
+
+## 2026-10-06 — Fixed ngrok domain and secret handling decision
+
+- User requested restoring a fully visible configuration block and keeping the ngrok URL permanently unchanged.
+- The code now has a visible configuration block at the top of `osintinstagram2.py` containing the names of the ngrok, Instagram and Telegram settings.
+- Real passwords/tokens are intentionally not committed to the public GitHub repository. They remain runtime/Colab variables. The old exposed credentials must be rotated because Git history may still contain them.
+- The ngrok startup path now explicitly requests `https://yin-spender-percent.ngrok-free.dev` and does not fall back to a random URL. If the domain is not available to the authenticated ngrok account, startup fails loudly instead of producing a different address.
+- Current ngrok documentation describes account development domains and fixed/custom endpoint URLs; exact availability of this specific domain can only be confirmed from the user's ngrok account at runtime.
