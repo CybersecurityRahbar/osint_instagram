@@ -1313,51 +1313,6 @@ class InstagramSearcher:
             print(f"   ⚠️ get_reels: {type(e).__name__}")
         return []
 
-    def _fetch_stories(self, username, max_count=50):
-        """القصص غير مدعومة في الوضع المجهول عادةً"""
-        try:
-            if hasattr(self.ig.public, 'get_stories'):
-                stories = self.ig.public.get_stories(username, max_count=max_count)
-                return list(stories) if stories else []
-            else:
-                print("   ℹ️ القصص غير مدعومة في الوضع المجهول — تخطي")
-                return []
-        except Exception as e:
-            print(f"   ⚠️ get_stories: {type(e).__name__}: {str(e)[:120]}")
-            return []
-
-    def _download_media(self, media, folder):
-        """تحميل الوسائط من URL مباشرة"""
-        os.makedirs(folder, exist_ok=True)
-        downloaded = []
-        try:
-            code = str(_extract(media, 'code', 'shortcode', 'pk', 'id', default='media'))
-            video_url = _extract(media, 'video_url', default=None)
-            image_url = _extract(media, 'display_url', 'thumbnail_url', 'image_url', default=None)
-
-            target_url = video_url or image_url
-            if not target_url:
-                print(f"      ⚠️ لا يوجد URL للوسائط")
-                return []
-
-            ext = 'mp4' if video_url else 'jpg'
-            filepath = os.path.join(folder, f"{code}.{ext}")
-
-            r = _http_session.get(str(target_url), timeout=60, stream=True)
-            if r.status_code == 200:
-                with open(filepath, 'wb') as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                kind = 'video' if ext == 'mp4' else 'image'
-                downloaded.append((filepath, kind))
-                print(f"      ✅ نُزّل: {os.path.basename(filepath)}")
-            else:
-                print(f"      ⚠️ HTTP {r.status_code} للوسائط")
-
-        except Exception as e:
-            print(f"      ⚠️ download: {type(e).__name__}: {str(e)[:140]}")
-        return downloaded
-
     def _post_caption_html(self, media, index, total, username):
         code = html_escape(str(_extract(media, 'code', 'shortcode', default='')))
         url = f"https://www.instagram.com/p/{code}/"
