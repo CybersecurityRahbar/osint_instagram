@@ -24,6 +24,10 @@ IG_PASSWORD = os.getenv("IG_PASSWORD", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# A fresh control token is generated per Colab runtime unless explicitly
+# supplied as an environment variable. It is never stored in Drive/GitHub.
+CONTROL_TOKEN = os.getenv("CONTROL_TOKEN") or secrets.token_urlsafe(24)
+
 START_MODE = "anonymous"
 REQUIRED_INSTAHARVEST_VERSION = "1.1.88"
 
@@ -53,6 +57,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import secrets
 import threading
 import time
 import traceback
@@ -3173,6 +3178,20 @@ a{color:#7cc7ff}
 app = Flask(__name__)
 
 
+@app.before_request
+def require_control_token():
+    public_paths = {"/", "/health", "/favicon.ico"}
+    if request.path in public_paths:
+        return None
+    supplied = str(request.headers.get("X-Control-Token", "") or "").strip()
+    if not secrets.compare_digest(supplied, CONTROL_TOKEN):
+        return jsonify({
+            "ok": False,
+            "error": "مفتاح التحكم مفقود أو غير صحيح."
+        }), 401
+    return None
+
+
 def api_status(message=None):
     status = InstagramClient.get_status()
     if message:
@@ -3230,6 +3249,16 @@ button:disabled{opacity:.55;cursor:not-allowed}
 <div class="card">
 <h1>🕵️ Instagram OSINT Scraper ULTRA v4</h1>
 <div class="sub">Anonymous ثابت + Login اختياري للميزات الخاصة</div>
+
+<div class="section">
+<div class="title">🛡️ حماية لوحة التحكم</div>
+<div class="small">أدخل مفتاح التحكم الذي طبعه Colab في الخلية عند التشغيل. يُحفظ محليًا في هذا المتصفح فقط.</div>
+<div class="row" style="margin-top:7px">
+<input type="password" id="controlToken" autocomplete="off" placeholder="مفتاح التحكم">
+<button id="saveControlToken" class="secondary" type="button">حفظ المفتاح</button>
+</div>
+<div id="tokenBox" class="badge wait">لم يتم حفظ مفتاح التحكم بعد</div>
+</div>
 
 <div class="section">
 <div class="title">🔐 وضع التشغيل</div>
@@ -3386,14 +3415,58 @@ function renderStatus(data){
   if(submit) submit.disabled=!waiting;
 }
 
+function controlToken(){
+  return (document.getElementById('controlToken')?.value ||
+          localStorage.getItem('ig_osint_control_token') || '').trim();
+}
+
+function apiHeaders(){
+  const token=controlToken();
+  return token ? {'X-Control-Token': token} : {};
+}
+
 async function refreshStatus(){
   try{
-    const r=await fetch('/status?once='+Date.now(),{cache:'no-store'});
-    renderStatus(await r.json());
+    const r=await fetch('/status?once='+Date.now(),{
+      cache:'no-store',
+      headers:apiHeaders()
+    });
+    const data=await r.json();
+    if(r.status===401){
+      const box=document.getElementById('tokenBox');
+      if(box){box.className='badge err';box.textContent=data.error||'مفتاح التحكم غير صحيح';}
+      renderStatus({status:'error',message:'أدخل مفتاح التحكم الصحيح ثم حدّث الحالة.'});
+      return;
+    }
+    renderStatus(data);
   }catch(e){
     renderStatus({status:'error',message:'تعذر الاتصال بالسيرفر'});
   }
 }
+
+
+
+const tokenInput=document.getElementById('controlToken');
+const tokenBox=document.getElementById('tokenBox');
+if(tokenInput){
+  const saved=localStorage.getItem('ig_osint_control_token')||'';
+  tokenInput.value=saved;
+  if(saved && tokenBox){
+    tokenBox.className='badge ok';
+    tokenBox.textContent='✅ مفتاح محفوظ محليًا';
+  }
+}
+document.getElementById('saveControlToken').addEventListener('click',()=>{
+  const token=tokenInput.value.trim();
+  if(!token){
+    tokenBox.className='badge err';
+    tokenBox.textContent='أدخل مفتاح التحكم أولاً.';
+    return;
+  }
+  localStorage.setItem('ig_osint_control_token',token);
+  tokenBox.className='badge ok';
+  tokenBox.textContent='✅ تم حفظ المفتاح محليًا في هذا المتصفح.';
+});
 
 document.querySelectorAll('input[name="mode"]').forEach(r=>{
   r.addEventListener('change',()=>paintMode(selectedMode()));
@@ -3406,7 +3479,7 @@ document.getElementById('applyMode').addEventListener('click',async()=>{
   try{
     const r=await fetch('/mode',{
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers:{'Content-Type':'application/json',...apiHeaders()},
       body:JSON.stringify({mode:selectedMode()})
     });
     const data=await r.json();
@@ -3430,7 +3503,7 @@ document.getElementById('submitCode').addEventListener('click',async()=>{
   btn.disabled=true;
   try{
     const body=new URLSearchParams({code});
-    const r=await fetch('/auth/code',{method:'POST',body});
+    const r=await fetch('/auth/code',{method:'POST',headers:apiHeaders(),body});
     const data=await r.json();
     renderStatus(data);
     if(!r.ok) alert(data.error || data.message || 'لم يتم قبول الرمز');
@@ -3444,7 +3517,7 @@ document.getElementById('submitCode').addEventListener('click',async()=>{
 
 document.getElementById('cancelLogin').addEventListener('click',async()=>{
   try{
-    const r=await fetch('/auth/cancel',{method:'POST'});
+    const r=await fetch('/auth/cancel',{method:'POST',headers:apiHeaders()});
     const data=await r.json();
     renderStatus(data);
     if(!r.ok) alert(data.error || data.message || 'تعذر إلغاء Login');
@@ -3460,7 +3533,7 @@ document.getElementById('scrapeForm').addEventListener('submit',async(e)=>{
   btn.textContent='⏳ تم إرسال المهمة…';
   try{
     const body=new URLSearchParams(new FormData(e.target));
-    const r=await fetch('/start',{method:'POST',body});
+    const r=await fetch('/start',{method:'POST',headers:apiHeaders(),body});
     const data=await r.json();
     alert(data.message || data.error || 'تم الإرسال');
   }catch(err){alert('تعذر إرسال المهمة');}
@@ -3474,7 +3547,7 @@ document.getElementById('searchForm').addEventListener('submit',async(e)=>{
   btn.textContent='⏳ تم إرسال البحث…';
   try{
     const body=new URLSearchParams(new FormData(e.target));
-    const r=await fetch('/search',{method:'POST',body});
+    const r=await fetch('/search',{method:'POST',headers:apiHeaders(),body});
     const data=await r.json();
     alert(data.message || data.error || 'تم إرسال البحث');
   }catch(err){alert('تعذر إرسال البحث');}
@@ -3719,6 +3792,8 @@ InstagramClient.init_paths()
 InstagramClient._load_user_cache()
 
 print(f"📦 instaharvest-v2: {INSTAHARVEST_VERSION}")
+print("🛡️ Control Panel Token (انسخه إلى صفحة ngrok):")
+print(f"   {CONTROL_TOKEN}")
 print("🧩 Features:")
 print("   🔓 Anonymous: profile + posts + reels + public search")
 print("   🔐 Login: saved session + Stories + Followers + Following")
