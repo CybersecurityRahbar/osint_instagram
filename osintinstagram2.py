@@ -383,9 +383,42 @@ def _table_columns(cursor, table):
     cursor.execute(f"PRAGMA table_info({table})")
     return {row[1] for row in cursor.fetchall()}
 
+def _backup_db_before_migration():
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        backup_dir = os.path.join(BASE_PATH, "db_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(
+            backup_dir, f"instagram_scraper_before_schema_migration_{stamp}.sqlite"
+        )
+        shutil.copy2(DB_PATH, path)
+        print(f"🛡️ نسخة احتياطية لقاعدة البيانات: {path}")
+        return path
+    except Exception as e:
+        print(f"⚠️ النسخة الاحتياطية: {type(e).__name__}: {str(e)[:160]}")
+        return None
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    if os.path.exists(DB_PATH):
+        needs_backup = False
+        if _table_exists(c, "accounts"):
+            cols = _table_columns(c, "accounts")
+            needs_backup = not {"is_business","category","external_url","profile_pic"}.issubset(cols)
+        else:
+            needs_backup = True
+        c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='following'")
+        if c.fetchone() is None:
+            needs_backup = True
+        if needs_backup:
+            conn.close()
+            _backup_db_before_migration()
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
 
     c.execute('''CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE,
@@ -857,7 +890,6 @@ class InstagramClient:
         time.sleep(random.uniform(a, b))
 
 # ============================================================
-# ============================================================
 # 8. 🔍 محرك البحث الشامل
 # ============================================================
 class UniversalSearcher:
@@ -890,73 +922,139 @@ class UniversalSearcher:
         analysis['type'] = 'general'
         return analysis
 
+    def _call_media_comments(self, media_pk, max_count=20):
+        try:
+            if hasattr(self.ig, "media") and hasattr(self.ig.media, "get_comments_parsed"):
+                return list(self.ig.media.get_comments_parsed(media_pk) or [])[:max_count]
+        except Exception:
+            pass
+        return []
+
+    def _hunt_mentions(self, query, max_posts=5, max_comments_per_post=20):
+        clean = str(query or "").lower().replace("#","").replace("@","").strip()
+        if not clean:
+            return []
+        mentions = []
+        try:
+            posts = list(self.ig.public.get_hashtag_posts(clean, max_count=max_posts) or [])
+        except Exception:
+            posts = []
+        for media in posts[:max_posts]:
+            pk = str(_extract(media, 'pk','id',default=''))
+            code = str(_extract(media, 'code','shortcode',default=''))
+            source = f"https://www.instagram.com/p/{code}/"
+            caption = str(_extract(media,'caption_text','caption',default='') or '')
+            if clean in caption.lower():
+                mentions.append({'type':'caption','source_pk':pk,'source_url':source,
+                                 'context':caption[:500],'mentioned_username':clean,
+                                 'mentioned_full_name':''})
+                save_mention(clean,'caption',pk,source,caption[:500],clean,'')
+
+            try:
+                comments = self._call_media_comments(pk, max_comments_per_post)
+                for comment in comments:
+                    txt = str(_extract(comment,'text','comment_text',default='') or '')
+                    if clean not in txt.lower():
+                        continue
+                    user = _extract(comment,'user',default={})
+                    uname = str(_extract(user,'username',default=''))
+                    fullname = str(_extract(user,'full_name','fullname',default=''))
+                    mentions.append({'type':'comment','source_pk':pk,'source_url':source,
+                                     'context':txt[:500],'commenter':uname,
+                                     'commenter_full_name':fullname})
+                    save_mention(clean,'comment',pk,source,txt[:500],uname,fullname)
+            except Exception:
+                pass
+            InstagramClient.human_delay(0.4,0.9)
+        return mentions
+
     def search(self, query, max_results_per_type=10, hunt_mentions=True):
         analysis = self.analyze_query(query)
         print(f"🔍 بحث شامل: '{query}' — النوع: {analysis['type']}")
-
         results = {
             'analysis': analysis,
             'users': [], 'hashtags': [], 'posts': [],
-            'reels': [], 'mentions': [],
-            'stats': {'total': 0}
+            'reels': [], 'mentions': [], 'stats': {'total': 0}
         }
 
-        # 1. إذا كان @user — اجلب البروفايل
         if analysis['type'] == 'user':
+            name = analysis['clean']
             try:
-                u = self.ig.public.get_profile(analysis['clean'])
-                if u:
-                    results['users'] = [u]
-                    print(f"   ✅ user: @{analysis['clean']}")
+                if InstagramClient._mode == 'login' and hasattr(self.ig, 'users'):
+                    u = self.ig.users.get_full_profile(name)
+                else:
+                    u = self.ig.public.get_profile(name)
+                if u: results['users'] = [u]
             except Exception as e:
-                print(f"   ⚠️ get_profile: {type(e).__name__}: {str(e)[:120]}")
+                print(f"   ⚠️ profile: {type(e).__name__}: {str(e)[:120]}")
 
-            # اجلب منشورات المستخدم أيضاً
             try:
-                posts = self.ig.public.get_posts(analysis['clean'], max_count=max_results_per_type)
-                if posts:
-                    results['posts'] = list(posts)
-                    print(f"   ✅ posts: {len(results['posts'])}")
-            except Exception as e:
-                print(f"   ⚠️ get_posts: {type(e).__name__}: {str(e)[:120]}")
+                results['posts'] = list(self.ig.public.get_posts(name, max_count=max_results_per_type) or [])
+            except Exception:
+                if InstagramClient._mode == 'login' and results['users']:
+                    try:
+                        uid = str(_extract(results['users'][0],'pk','id',default=''))
+                        results['posts'] = list(self.ig.feed.get_all_posts(uid, max_posts=max_results_per_type, delay=1.0) or [])
+                    except Exception:
+                        pass
+            try:
+                results['reels'] = list(self.ig.public.get_reels(name, max_count=max_results_per_type) or [])
+            except Exception:
+                pass
 
-        # 2. إذا كان #hashtag — اجلب منشورات الهاشتاج
         elif analysis['type'] == 'hashtag':
+            tag = analysis['clean']
             try:
-                posts = self.ig.public.get_hashtag_posts(analysis['clean'], max_count=max_results_per_type)
-                if posts:
-                    results['posts'] = list(posts)
-                    results['hashtags'] = [{'name': analysis['clean'], 'media_count': len(posts)}]
-                    print(f"   ✅ hashtag posts: {len(results['posts'])}")
-            except Exception as e:
-                print(f"   ⚠️ get_hashtag_posts: {type(e).__name__}: {str(e)[:120]}")
+                results['posts'] = list(self.ig.public.get_hashtag_posts(tag, max_count=max_results_per_type) or [])
+                results['hashtags'] = [{'name':tag,'media_count':len(results['posts'])}]
+            except Exception:
+                if InstagramClient._mode == 'login' and hasattr(self.ig, 'search'):
+                    try:
+                        results['hashtags'] = list(self.ig.search.search_hashtags(tag) or [])[:max_results_per_type]
+                    except Exception:
+                        pass
 
-        # 3. بحث عام — حاول كـ user أولاً
         else:
-            try:
-                u = self.ig.public.get_profile(query)
-                if u:
-                    results['users'] = [u]
-                    print(f"   ✅ user: {query}")
-            except Exception as e:
-                print(f"   ⚠️ get_profile (general): {type(e).__name__}")
+            if InstagramClient._mode == 'login' and hasattr(self.ig, 'search'):
+                try:
+                    results['users'] = list(self.ig.search.search_users(query) or [])[:max_results_per_type]
+                except Exception:
+                    pass
+                try:
+                    results['hashtags'] = list(self.ig.search.search_hashtags(query) or [])[:max_results_per_type]
+                except Exception:
+                    pass
+            elif hasattr(self.ig, 'public'):
+                try:
+                    results['users'] = list(self.ig.public.search(query) or [])[:max_results_per_type]
+                except Exception:
+                    try:
+                        u = self.ig.public.get_profile(query)
+                        if u: results['users'] = [u]
+                    except Exception:
+                        pass
 
-        results['stats']['total'] = (len(results['users']) + len(results['hashtags']) +
-                                     len(results['posts']) + len(results['mentions']))
+        if hunt_mentions and analysis['type'] == 'general':
+            results['mentions'] = self._hunt_mentions(
+                query, max_posts=min(5,max_results_per_type),
+                max_comments_per_post=20
+            )
 
+        results['stats']['total'] = sum(
+            len(results[k]) for k in ('users','hashtags','posts','reels','mentions')
+        )
         self._save_search_results(query, results)
         self._send_summary(query, results)
-
         return results
 
     def _save_search_results(self, query, results):
         try:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-            for rtype in ['users', 'hashtags', 'posts']:
+            for rtype in ['users', 'hashtags', 'posts', 'reels', 'mentions']:
                 for item in results[rtype]:
-                    username = str(_extract(item, 'username', default=''))
-                    full_name = str(_extract(item, 'full_name', 'fullname', default=''))
-                    pk = str(_extract(item, 'pk', 'id', default=''))
+                    username = str(_extract(item, 'username', 'commenter', default=''))
+                    full_name = str(_extract(item, 'full_name', 'fullname', 'commenter_full_name', default=''))
+                    pk = str(_extract(item, 'pk', 'id', 'source_pk', default=''))
                     c.execute('''INSERT INTO search_results
                         (query, result_type, username, full_name, pk, extra_data, created_at)
                         VALUES (?,?,?,?,?,?,?)''',
@@ -1635,10 +1733,10 @@ class InstagramSearcher:
             rf = os.path.join(REPORTS_PATH, f"{username}_posts_{ts}.csv")
             with open(rf, 'w', newline='', encoding='utf-8-sig') as f:
                 w = csv.writer(f)
-                w.writerow(['الكود','الرابط','النوع','إعجابات','تعليقات','التاريخ','النص'])
+                w.writerow(['الكود','الرابط','النوع','إعجابات','تعليقات','مشاهدات','تشغيل','التاريخ','النص'])
                 for r in posts:
                     w.writerow([r['post_code'], r['post_url'], r['media_type'],
-                                r['like_count'], r['comment_count'], r['taken_at'],
+                                r['like_count'], r['comment_count'], r['view_count'], r['play_count'], r['taken_at'],
                                 (r['caption'] or '')[:500]])
             return rf
         except Exception as e:
