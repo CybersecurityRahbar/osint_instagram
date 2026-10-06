@@ -1143,13 +1143,13 @@ class InstagramClient:
 
         # 1) الجلسة المحفوظة هي المسار الأول والأكثر أماناً للـrate limit
         client = None
-        client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY == "legacy_first"))
+        client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
         session_loaded = False
 
         if os.path.exists(cls._SESSION_FILE):
             try:
                 client.load_settings(cls._SESSION_FILE, override_app_version=True)
-                cls._configure_client(client, legacy=(LOGIN_STRATEGY == "legacy_first"))
+                cls._configure_client(client, legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
                 session_loaded = True
                 print("♻️ تم تحميل الجلسة المحفوظة مع ترقية ملف app profile")
 
@@ -1176,7 +1176,7 @@ class InstagramClient:
                         print(f"⚠️ تعذر التحقق من الجلسة المحفوظة: {type(session_check_error).__name__}: {str(session_check_error)[:160]}")
             except Exception as e:
                 print(f"⚠️ تعذر تحميل الجلسة المحفوظة: {type(e).__name__}: {str(e)[:160]}")
-                client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY == "legacy_first"))
+                client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
 
         if not session_loaded:
             print("ℹ️ لا توجد جلسة محفوظة — سيتم تنفيذ محاولة دخول واحدة فقط بكلمة المرور")
