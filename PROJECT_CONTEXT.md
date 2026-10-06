@@ -368,3 +368,51 @@ Do not delete the existing Drive session before testing. First restart/clean the
 ### تفسير الاختبار القادم
 - نجاح الدخول بعد تحديث الملف إلى 450 سيعني أن سبب `needs_upgrade` كان profile قديم في بيئة الأداة.
 - استمرار `needs_upgrade` بعد 450 سيعني أن Instagram يرفض الحساب/مسار `accounts/login/` نفسه رغم ملف التطبيق الحالي، وحينها لن نستمر في تغيير أرقام الإصدارات عشوائياً.
+
+## 2026-10-06 — توسعة osintinstagram2.py إلى Anonymous + Login
+
+### الهدف
+- الاحتفاظ بـ `instaharvest-v2 1.1.88` كقاعدة النسخة الثانية لأن المستخدم اختبرها عملياً ونجحت في جلب منشورات الحسابات العامة بدون تسجيل دخول.
+- عدم استبدال المسار Anonymous الذي نجح.
+- إضافة Login Mode قابل للتبديل من صفحة التحكم نفسها.
+- استخدام جلسة مملوكة للأداة ومحفوظة في Google Drive، بدلاً من Session ID من المتصفح.
+
+### ما أضيف
+- تبديل حي من صفحة Flask عبر `/mode` بين:
+  - `anonymous`: لا يحتاج تسجيل دخول، للبيانات العامة.
+  - `login`: يستعمل `IG_USERNAME/IG_PASSWORD` أو الجلسة المحفوظة.
+- حالة حيّة للعميل عبر `/status` مع polling من صفحة التحكم.
+- حفظ جلسة Login في:
+  `/content/drive/MyDrive/Instagram_Scraper_DB/instaharvest_session.json`
+- تحميل الجلسة والتحقق منها قبل إعادة استخدام كلمة المرور.
+- عند فشل Login يعود العميل إلى Anonymous حتى لا يتوقف السيرفر.
+- Stories عبر `stories.get_user_stories` في Login Mode مع fallback العام عند توفره.
+- Followers عبر `friendships.get_all_followers`، مع fallback لـ GraphQL عند توفره.
+- Following عبر `friendships.get_all_following`.
+- Highlights عبر `stories.get_highlights_tray` مع fallback العام.
+- تنزيل الوسائط باستخدام downloader الخاص بالمكتبة في Login Mode أولاً، ثم URL fallback.
+- Comments من الـpublic API أو `media.get_comments_parsed`.
+- Mention Hunter موسع على الهاشتاج/الكابشن والتعليقات، مع تخزين النتائج في SQLite.
+- البحث في Login Mode يستخدم `search_users` و`search_hashtags`، مع public fallback.
+- CSV يشمل likes/comments/views/plays.
+- HTML report يشمل profile/stories/highlights/followers/following/posts.
+- Following وHighlights أصبحت لها جداول تخزين تراكمية.
+- بيانات المنشور الموجود في SQLite يتم تحديث إحصاءاته عند إعادة العثور عليه بدلاً من تجاهله تماماً.
+
+### قاعدة البيانات
+- نفس `instagram_data.db` السابق ما زال مستخدماً.
+- تمت إضافة أعمدة profile إضافية إلى `accounts` بطريقة ALTER TABLE فقط.
+- تمت إضافة جدول `following` مع uniqueness لكل account.
+- قبل migration توجد نسخة احتياطية تلقائية عندما تكون تغييرات schema مطلوبة.
+- لا يتم حذف المنشورات أو التعليقات أو القصص القديمة بسبب هذه التوسعة.
+
+### التشغيل
+- الوضع الافتراضي يبقى Anonymous.
+- المستخدم يستطيع فتح صفحة التحكم على عنوان ngrok الحالي، اختيار Login، الضغط على "تطبيق الوضع"، وانتظار ظهور الحالة `Login — العميل جاهز`.
+- بعد ذلك يمكن تفعيل Stories وFollowers وFollowing وHighlights من نموذج السكراب.
+- الرجوع إلى Anonymous لا يحذف ملف جلسة Login.
+
+### ملاحظة الاختبار
+- الاختبار الواقعي النهائي يجب أن يكون في Colab نفسه، لأن قبول Instagram لعملية Login والجلسة لا يمكن محاكاته محلياً.
+- لا ينبغي إعادة استخدام Session ID من المتصفح بعد حادثة تسجيل الخروج/التحقق السابقة.
+- `instaharvest-v2` يعلن رسمياً في وثائقه عن دعم login/save_session/load_session وStories/Highlights وFollowers وDownload، وهو سبب اعتماد هذه الواجهة على تلك المسارات. 
