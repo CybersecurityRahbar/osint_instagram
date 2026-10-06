@@ -1831,6 +1831,7 @@ class InstagramSearcher:
             ai = get_account_info(username) or {}
             posts = get_posts_with_comments(aid, order=order)
             fl = get_followers(aid)
+            following = get_following(aid)
             stories = get_stories(aid)
             highlights = get_highlights(aid)
 
@@ -1860,6 +1861,30 @@ class InstagramSearcher:
                         <h2 class="section-title">📖 القصص ({shown})</h2>
                         <div class="thumb-grid">{items}</div>
                     </section>'''
+
+            highlights_html = ""
+            if highlights:
+                rows = "".join(
+                    f"<div class='follower-item'><b>📌 {html_escape(str(h.get('title') or 'Highlight'))}</b> "
+                    f"— {int(h.get('media_count') or len(h.get('items', [])))} عنصر</div>"
+                    for h in highlights
+                )
+                highlights_html = (
+                    f"<section class='section'><h2 class='section-title'>📌 Highlights ({len(highlights)})</h2>"
+                    f"<div class='followers-grid'>{rows}</div></section>"
+                )
+
+            following_html = ""
+            if following:
+                rows = "".join(
+                    f"<div class='follower-item'>@{html_escape(str(x.get('username') or ''))} — "
+                    f"{html_escape(str(x.get('full_name') or '—'))}</div>"
+                    for x in following
+                )
+                following_html = (
+                    f"<section class='section'><h2 class='section-title'>➡️ Following ({len(following)})</h2>"
+                    f"<div class='followers-grid'>{rows}</div></section>"
+                )
 
             pic_html = (f"<img src='data:image/jpeg;base64,{pic_b64}' class='profile-pic'>"
                         if pic_b64 else
@@ -1924,7 +1949,9 @@ border-radius:16px;padding:20px;margin-bottom:20px}
 {'<div style="margin-top:10px;padding:10px;background:rgba(0,0,0,0.2);border-radius:8px">'+str(ai.get('bio',''))+'</div>' if ai.get('bio') else ''}
 </div></section>
 {stories_html}
+{highlights_html}
 <section class="section"><h2 class="section-title">👥 المتابعون ({len(fl)})</h2>{fl_html}</section>
+{following_html}
 <section class="section"><h2 class="section-title">📸 المنشورات ({len(posts)})</h2>{posts_html}</section>
 <div style="text-align:center;padding:20px;opacity:0.6">Instagram OSINT Scraper ULTRA v3.1</div>
 </div></body></html>"""
@@ -1973,6 +2000,7 @@ button{width:100%;padding:12px;border:0;border-radius:10px;color:white;font-weig
 <div class="sec"><div class="st">📅 الترتيب</div><div class="grid2"><label class="choice"><input type="radio" name="order" value="desc" checked> الأحدث أولاً</label><label class="choice"><input type="radio" name="order" value="asc"> الأقدم أولاً</label></div></div>
 <div class="sec"><div class="st">⚙️ البيانات المتقدمة</div>
 <label class="opt"><input type="checkbox" name="fetch_comments" value="1"> 💬 التعليقات</label>
+<div class="hint">عدد التعليقات لكل منشور: <input type="number" style="width:85px" name="max_comments" value="20" min="1" max="200"></div>
 <label class="opt"><input type="checkbox" name="fetch_followers" value="1"> 👥 أسماء المتابعين <span class="small">(Login)</span></label>
 <div class="hint">عدد المتابعين: <input type="number" style="width:85px" name="max_followers" value="100" min="1" max="1000"></div>
 <label class="opt"><input type="checkbox" name="fetch_following" value="1"> ➡️ Following <span class="small">(Login)</span></label>
