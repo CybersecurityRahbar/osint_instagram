@@ -481,3 +481,12 @@ Do not delete the existing Drive session before testing. First restart/clean the
 
 ### Important limitation
 - The revised control panel itself makes no background /status requests. If the exact new revision still produces repeated HTTP 200 lines after opening the page, those requests are originating from another client/tab/proxy layer or from an older server instance, not from the current page JavaScript.
+
+## 2026-10-06 — Final control-panel security hardening
+
+- The ngrok control panel is publicly reachable, so leaving control endpoints unauthenticated was an unsafe design.
+- Added a per-Colab-runtime control token using Python `secrets`. If `CONTROL_TOKEN` is not supplied, the tool generates one and prints it once in Colab.
+- Protected `/status`, `/mode`, `/auth/code`, `/auth/cancel`, `/start`, and `/search` with the `X-Control-Token` header.
+- The browser stores the token only in localStorage; it is not written to Google Drive or GitHub.
+- `/`, `/health`, and `/favicon.ico` remain public so the panel can load and the browser does not create unnecessary authenticated noise.
+- The new token does not create background polling; status remains manual.
