@@ -342,3 +342,29 @@ Do not delete the existing Drive session before testing. First restart/clean the
 ### قاعدة البيانات
 - لا تغيير في مسار قاعدة البيانات أو حذف السجلات.
 - النسخة الاحتياطية التلقائية قبل migrations ما زالت مفعلة.
+
+## 2026-10-06 — اختبار strict_legacy كشف رفض ملف التطبيق 449
+
+### نتيجة المستخدم بعد strict_legacy
+- أصبح سجل الدخول:
+  `🔐 Legacy direct: accounts/login/ فقط — بدون CAA fallback`
+  ثم:
+  `Your version of Instagram is out of date. Please upgrade your app to log in to Instagram.`
+- هذا يثبت أن الطلب وصل إلى مسار `accounts/login/` فعلاً، وأن سبب فشل CAA السابق لم يعد يخفي النتيجة الحقيقية.
+
+### التحقق من الحالة الحالية
+- إصدار `instagrapi 3.0.20` يستخدم ملف Android افتراضياً لـ Instagram 449.
+- صفحة إصدارات Instagram الحالية التي تم العثور عليها في 2026-10-06 تعرض `450.0.0.50.77` كإصدار Android الأحدث المنشور في 2026-10-05، مع version code `385611438`.
+- upstream instagrapi لديه بالفعل issue مفتوح حول `needs_upgrade` أثناء username/password login، لذلك انتقالنا إلى strict_legacy كشف المشكلة بدلاً من إخفائها خلف CAA.
+
+### التعديل في هذه النسخة
+- إضافة:
+  `LEGACY_APP_VERSION = "450.0.0.50.77"`
+  `LEGACY_APP_VERSION_CODE = "385611438"`
+- قبل `accounts/login/` يتم تطبيق app_version/version_code صراحةً على عميل Legacy باستخدام `set_device()`.
+- يتم تطبيق الملف نفسه على العميل بعد تحميل الجلسة أيضاً، حتى لا تعيد `override_app_version=True` الملف تلقائياً إلى 449 قبل الاستخدام.
+- لا توجد محاولة CAA أو Session ID في هذا المسار.
+
+### تفسير الاختبار القادم
+- نجاح الدخول بعد تحديث الملف إلى 450 سيعني أن سبب `needs_upgrade` كان profile قديم في بيئة الأداة.
+- استمرار `needs_upgrade` بعد 450 سيعني أن Instagram يرفض الحساب/مسار `accounts/login/` نفسه رغم ملف التطبيق الحالي، وحينها لن نستمر في تغيير أرقام الإصدارات عشوائياً.
