@@ -1,49 +1,103 @@
 # Instagram OSINT Scraper
 
-Colab-based Instagram OSINT utility using an authenticated instagrapi session.
+Colab-based Instagram OSINT utility built around instaharvest-v2 1.1.88.
+
+## Current tool
+
+The current expanded tool is osintinstagram2.py.
+It keeps the tested Anonymous public-data path separate from the authenticated Login path.
 
 ## Google Colab setup
 
-1. In a separate Colab cell, install the exact Instagram client version required by the tool:
-   ```python
-   !pip install -q --force-reinstall instagrapi==3.0.20
-   ```
-2. The main tool is a single Python file/cell. Paste the complete `osintinstagram.py` code into one Colab cell and run it.
-3. No `requirements.txt` or other dependency file is required by the tool.
-4. Keep real credentials out of GitHub. Put them into the runtime/secret mechanism instead of committing them.
-5. The tool stores the Instagram session and data on Google Drive so the session can be reused across Colab runtimes.
+1. In a separate Colab cell, install the exact version required by the tool:
 
-## Dependency compatibility
+       !pip install -q --force-reinstall instaharvest-v2==1.1.88
 
-The required instagrapi version (`3.0.20`) is declared inside `osintinstagram.py`. At startup the script checks the installed version and stops with a clear message if it does not match. This keeps the one-cell runtime deterministic without requiring an external requirements file.
+2. Set the runtime variables in Colab/Secrets, then paste the complete osintinstagram2.py file into one Colab code cell and run it.
+3. No requirements.txt or extra Python module is required by the main tool.
+4. Google Drive is used for the cumulative database, media and the persistent Login session.
 
-## Session compatibility
+### Runtime variables
 
-The project targets instagrapi==3.0.20. The code uses load_settings(..., override_app_version=True) for older saved sessions and does not hard-code an Instagram app version.
+Use these only in the Colab runtime/Secrets area, never in GitHub:
 
-## 429 handling
+       import os
+       os.environ['NGROK_AUTH_TOKEN'] = '...'
+       os.environ['IG_USERNAME'] = '...'
+       os.environ['IG_PASSWORD'] = '...'
+       os.environ['TELEGRAM_TOKEN'] = '...'
+       os.environ['TELEGRAM_CHAT_ID'] = '...'
 
-HTTP 429 from Instagram is a server-side throttle. The tool does not blindly retry the login endpoint; it enters a cooldown and reports the reason. Avoid repeatedly restarting login attempts while the endpoint is throttled.
+The tool does not commit these secrets.
 
-## Project context
+## Anonymous / Login architecture
 
-See PROJECT_CONTEXT.md for the cumulative investigation log and engineering decisions.
+### Anonymous
 
-## Media and Telegram output
+Anonymous mode uses the public library path:
 
-- Normal profile scraping uses authenticated `user_medias()` and avoids the separate clips endpoint.
-- Instagram media is downloaded with instagrapi's native media download helpers before being sent to Telegram.
-- Failed media remain retryable on later runs.
-- Telegram output uses numbered HTML captions, caption-above-media, inline buttons, and Bot API Rich Messages where available.
-- Profile retrieval sends the profile picture together with account statistics and public profile details.
-- HTTP 429 is treated as a temporary Instagram throttle, not automatic logout; the session is preserved.
+       Instagram.anonymous(unlimited=True)
+       public.get_profile()
+       public.get_posts()
+       public.get_reels()
+       public search/comments/highlights where supported
 
+The normal profile post path is isolated from the authenticated collectors so optional features cannot prevent basic public scraping.
 
+### Login
 
-## Authentication and data collection architecture
+Login mode is a separate state machine:
 
-The project now uses instagrapi's explicit `login_legacy()` path for fresh username/password authentication, with the private `requests` transport selected for compatibility with the proven pre-v3 architecture. After the first successful login, the tool persists its own session settings in Google Drive and reuses them.
+1. The tool first looks for its own saved session in Google Drive.
+2. A valid saved session is loaded and reused.
+3. Password login starts only when no usable saved session exists.
+4. If Instagram requests an email/SMS verification code, the Login worker pauses at the library challenge callback.
+5. The control panel exposes a verification-code field. The code is kept in RAM only and is not written to GitHub or Drive.
+6. After successful authentication, the tool saves the session back to Drive.
+7. While the session stays valid, later scrapes and searches reuse the active client instead of logging in again.
 
-For authenticated profile collection, the tool prefers private/mobile API methods for profile lookup, Stories, Followers, Highlights, and comments. It uses native instagrapi download helpers for posts, videos, albums, and Stories, and records like/comment/view/play metrics when returned.
+Session file:
 
-Browser Session ID cloning is intentionally disabled because it caused account security challenges in testing. The tool also stops on HTTP 429 or native security challenges rather than attempting to bypass them.
+       Google Drive/Instagram_Scraper_DB/instaharvest_session.json
+
+## Control panel and request volume
+
+The control panel has no automatic status polling loop and makes no page-load /status request.
+Status refresh is manual. Login start, status refresh, verification-code submission and cancellation are individual requests.
+This is intentional so keeping the ngrok page open does not generate hundreds of repeated HTTP 200 status requests in Colab.
+
+## Data collected
+
+Depending on the selected options and what Instagram returns, the tool can collect and store:
+
+- profile information
+- posts, photos, videos and carousels
+- Reels
+- comments
+- Stories (Login)
+- Highlights
+- follower samples (Login)
+- following samples (Login)
+- like/comment/view/play counters when available
+- cumulative SQLite storage
+- HTML and CSV reports
+- Telegram delivery
+- user/hashtag search
+- optional Mention Hunter
+
+## Data safety
+
+The existing database path is preserved:
+
+       Google Drive/Instagram_Scraper_DB/instagram_data.db
+
+The normal migrations do not delete the existing database. A database backup is created before schema migration changes when required.
+
+## Security
+
+Never commit Instagram passwords, Telegram bot tokens, ngrok tokens, session files, or verification codes to GitHub.
+Browser Session ID cloning remains disabled because it caused account-security problems during earlier testing.
+
+## Project history
+
+See PROJECT_CONTEXT.md for the cumulative debugging history, architecture decisions, runtime evidence and unresolved limitations.
