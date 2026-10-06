@@ -63,6 +63,7 @@ Session file:
 ## Control panel and request volume
 
 The control panel has no automatic status polling loop and makes no page-load /status request.
+The ngrok control panel is also protected by a runtime access token printed once in Colab; the browser stores it only in localStorage.
 Status refresh is manual. Login start, status refresh, verification-code submission and cancellation are individual requests.
 This is intentional so keeping the ngrok page open does not generate hundreds of repeated HTTP 200 status requests in Colab.
 
