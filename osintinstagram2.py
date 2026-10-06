@@ -765,7 +765,7 @@ def init_db():
 
     # Dedupe comments without rewriting the existing table.
     cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_dedupe
+        CREATE INDEX IF NOT EXISTS idx_comments_dedupe
         ON comments(post_id, commenter_username, created_at, comment_text)
     """)
     cur.execute("""
@@ -936,11 +936,22 @@ def save_comment(post_id, comment):
         )
         conn = db_connect()
         conn.execute("""
-            INSERT OR IGNORE INTO comments (
+            INSERT INTO comments (
                 post_id, comment_text, commenter_username,
                 commenter_full_name, created_at
-            ) VALUES (?,?,?,?,?)
-        """, (post_id, text, username, fullname, created))
+            )
+            SELECT ?,?,?,?,?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM comments
+                WHERE post_id=?
+                  AND commenter_username=?
+                  AND created_at=?
+                  AND comment_text=?
+            )
+        """, (
+            post_id, text, username, fullname, created,
+            post_id, username, created, text
+        ))
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -1347,10 +1358,10 @@ class InstagramClient:
         if requested_mode not in ("anonymous", "login"):
             raise ValueError("الوضع يجب أن يكون anonymous أو login")
 
-        with CLIENT_SWITCH_LOCK:
-            if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
-                raise RuntimeError("لا يمكن تبديل الوضع أثناء تنفيذ مهمة سكراب/بحث.")
+        if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+            raise RuntimeError("لا يمكن تبديل الوضع أثناء تنفيذ مهمة سكراب/بحث.")
 
+        with CLIENT_SWITCH_LOCK:
             old_ig = cls._ig
             old_mode = cls._mode
             old_status = cls._status
@@ -1390,8 +1401,8 @@ class InstagramClient:
                     f"تم الإبقاء على {cls._mode_label()}: {cls._last_error}"
                 )
                 raise
-            finally:
-                INSTAGRAM_JOB_LOCK.release()
+            # Lock order is always JOB -> CLIENT to avoid deadlocks.
+            INSTAGRAM_JOB_LOCK.release()
 
     @classmethod
     def get_client(cls):
@@ -1924,7 +1935,7 @@ class InstagramSearcher:
                 InstagramClient._save_user_cache()
 
             info = {
-                "username": str(extract(user, "username", default=username) or username),
+                "username": str(extract(user, "username", default=username) or username).lower().lstrip("@"),
                 "full_name": str(extract(user, "full_name", "fullname", default="") or ""),
                 "bio": str(extract(user, "biography", "bio", default="") or ""),
                 "posts_count": int(extract(user, "media_count", "posts_count", default=0) or 0),
@@ -2125,14 +2136,24 @@ class InstagramSearcher:
             return []
 
     def _fetch_highlights(self, username, max_count=20):
-        uid = self._get_user_id(username)
-        if not uid:
-            return []
+        username = self._profile_username(username)
         try:
-            items = self._call(self.ig, "stories.get_highlights_tray", uid)
-            if items is None and hasattr(self.ig, "public"):
+            # Public highlights are attempted first in Anonymous mode.
+            if InstagramClient._mode == "anonymous" and hasattr(self.ig, "public"):
                 items = self._call(self.ig.public, "get_highlights", username)
+                items = list(items or [])
+                print(f"📌 public highlights → {len(items)}")
+                return items[:max_count]
+
+            uid = self._get_user_id(username)
+            if not uid:
+                return []
+
+            items = self._call(self.ig, "stories.get_highlights_tray", uid)
             items = list(items or [])
+            if not items and hasattr(self.ig, "public"):
+                items = self._call(self.ig.public, "get_highlights", username)
+                items = list(items or [])
             print(f"📌 highlights → {len(items)}")
             return items[:max_count]
         except Exception as exc:
@@ -2592,10 +2613,33 @@ class InstagramSearcher:
 
         # Optional independent collectors.
         reels_count = 0
+        reels_downloaded = 0
         if fetch_reels and not InstagramClient.is_throttled():
             reels = self._fetch_reels(username, max_reels)
-            reels_count = len(reels)
-            print(f"🎬 Reels: {reels_count}")
+            unique_reels = dedupe_items(reels)
+            target_codes = {
+                str(extract(m, "code", "shortcode", "pk", "id", default="") or "")
+                for m in targets
+            }
+            reels_to_process = []
+            for reel in unique_reels:
+                key = str(extract(reel, "code", "shortcode", "pk", "id", default="") or "")
+                if key and key in target_codes:
+                    continue
+                reels_to_process.append(reel)
+            reels_to_process = reels_to_process[:safe_int(max_reels, 20, 1, 100)]
+            reels_count = len(reels_to_process)
+            print(f"🎬 Reels جديدة للمعالجة: {reels_count}")
+            for idx, reel in enumerate(reels_to_process, 1):
+                if InstagramClient.is_throttled():
+                    break
+                print(f"🎬 Reel [{idx}/{len(reels_to_process)}] "
+                      f"{extract(reel, 'code', 'shortcode', 'pk', default='?')}")
+                if self._process_media(
+                    reel, username, folder, idx, len(reels_to_process),
+                    fetch_comments=fetch_comments, max_comments=max_comments
+                ):
+                    reels_downloaded += 1
 
         followers_count = 0
         following_count = 0
@@ -2635,7 +2679,7 @@ class InstagramSearcher:
             f"👤 @{html_escape(username)}\n"
             f"📌 المنشورات: <b>{len(targets)}</b>\n"
             f"✅ نُفّذ بنجاح: <b>{successful}</b>\n"
-            f"🎬 Reels: <b>{reels_count}</b>\n"
+            f"🎬 Reels: <b>{reels_count}</b> — نُزّل <b>{reels_downloaded}</b>\n"
             f"👥 Followers: <b>{followers_count}</b>\n"
             f"➡️ Following: <b>{following_count}</b>\n"
             f"📖 Stories: <b>{stories_count}</b>\n"
