@@ -536,3 +536,33 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Static source check confirms the code and cancel routes still exist.
 - Static source check confirms no automatic setInterval, setTimeout, or page-load status refresh remains.
 - Live Instagram verification still requires the user's Colab runtime.
+
+## 2026-10-07 — Runtime proof: callback arity mismatch blocked verification UI
+
+### New Colab evidence
+- Login reached Instagram's auth_platform checkpoint and Instagram sent a verification request.
+- The Login worker then failed with:
+  `TypeError: instagram_challenge_callback() missing 1 required positional argument: 'ctx'`
+- The traceback shows `instaharvest_v2/auth_platform.py` calling `challenge_callback()` with zero arguments.
+- Therefore the callback crashed before setting the runtime state to `waiting_code`.
+
+### Root cause confirmed
+- The library has two callback call shapes in the installed 1.1.88 code:
+  - the generic ChallengeHandler path calls the callback with a context object;
+  - the auth_platform path calls it with no positional arguments.
+- Our callback originally required `ctx`, so it was incompatible with the auth_platform branch actually used by the user's Login.
+
+### Fix
+- Changed the callback signature to `instagram_challenge_callback(ctx=None)`.
+- When ctx is absent, the UI displays a generic 'Instagram sent a verification code' message instead of trying to read a contact field.
+- The callback still supports a context object when the other ChallengeHandler path supplies one.
+- The verification input is now editable throughout the Login process; the Send Code button remains disabled until the server reports `waiting_code`.
+- This prevents the field from appearing visually dead while Login is transitioning.
+- No automatic polling was reintroduced.
+
+### Expected next behavior
+- Login reaches auth_platform.
+- The callback executes successfully regardless of whether the library supplies a context argument.
+- The server enters `waiting_code`.
+- Manual status refresh shows `waiting_code` and enables the Send Code button.
+- The user can paste the received code and submit it.
