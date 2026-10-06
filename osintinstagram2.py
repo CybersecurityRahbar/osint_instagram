@@ -1504,7 +1504,14 @@ class InstagramClient:
             target_mode="login",
         )
         print("🔐 بدء Login للحساب المهيأ في بيئة Colab.")
-        result = ig.login(IG_USERNAME, IG_PASSWORD)
+        # IMPORTANT: constructor-level challenge_callback is used by the
+        # ChallengeHandler, but AuthAPI.login() requires the callback to be
+        # passed explicitly for checkpoint/auth_platform flows in 1.1.88.
+        result = ig.login(
+            IG_USERNAME,
+            IG_PASSWORD,
+            challenge_callback=instagram_challenge_callback,
+        )
         if result is False:
             raise RuntimeError("المكتبة أعادت False من ig.login().")
 
@@ -1560,11 +1567,21 @@ class InstagramClient:
                 )
                 set_job_state("done", "", "login", "تم إلغاء Login")
             else:
+                error_text = redact_error(exc)
+                if "Email verification needed" in error_text:
+                    user_message = (
+                        "❌ Instagram طلب تحققًا بالبريد، لكن callback الخاص بالرمز "
+                        "لم يُقبل من مسار Login الحالي."
+                    )
+                else:
+                    user_message = (
+                        "❌ فشل Login. راجع تفاصيل الخطأ ثم أعد المحاولة فقط عند الحاجة."
+                    )
                 set_auth_state(
                     "error",
-                    "❌ فشل Login. راجع تفاصيل الخطأ ثم أعد المحاولة فقط عند الحاجة.",
+                    user_message,
                     target_mode="login",
-                    error=redact_error(exc),
+                    error=error_text,
                 )
                 set_job_state("error", "", "login", redact_error(exc))
             print(f"❌ Login: {redact_error(exc)}")
@@ -3301,6 +3318,8 @@ button:disabled{opacity:.55;cursor:not-allowed}
 </div>
 <div class="small" style="margin-top:7px">
 الرمز لا يُحفظ في Google Drive أو GitHub؛ يبقى في الذاكرة فقط حتى يستلمه Login.
+بعد ضغط «تفعيل Login»، استخدم «تحديث الحالة» يدويًا مرة واحدة عندما يصل الرمز؛
+عند ظهور حالة «بانتظار الرمز» ستصبح الخانة مفعلة.
 </div>
 </div>
 </div>
@@ -3411,18 +3430,28 @@ function renderStatus(data){
 
   const panel=document.getElementById('authPanel');
   const authMessage=document.getElementById('authMessage');
+  const loginInProgress =
+    ['starting','loading_session','authenticating','waiting_code','verifying'].includes(auth.state);
   const waiting=auth.state==='waiting_code';
   if(panel){
-    panel.style.display=(waiting || auth.state==='verifying')?'block':'none';
+    panel.style.display=loginInProgress ? 'block' : 'none';
   }
   if(authMessage){
-    authMessage.textContent=waiting
-      ? ((auth.message||'أدخل الرمز المرسل من Instagram.') +
-         (auth.contact_point ? ' · جهة التحقق: '+auth.contact_point : ''))
-      : (auth.message||'');
+    if(waiting){
+      authMessage.textContent =
+        (auth.message||'أدخل رمز التحقق المرسل من Instagram ثم اضغط «إرسال الرمز».') +
+        (auth.contact_point ? ' · جهة التحقق: '+auth.contact_point : '');
+    } else if(loginInProgress){
+      authMessage.textContent =
+        (auth.message||'⏳ Login قيد التنفيذ. اضغط «تحديث الحالة» لمعرفة متى أصبح الرمز مطلوبًا.');
+    } else {
+      authMessage.textContent=auth.message||'';
+    }
   }
   const submit=document.getElementById('submitCode');
+  const codeInput=document.getElementById('verificationCode');
   if(submit) submit.disabled=!waiting;
+  if(codeInput) codeInput.disabled=!waiting;
 }
 
 function controlToken(){
