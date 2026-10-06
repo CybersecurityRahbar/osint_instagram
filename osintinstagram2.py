@@ -112,6 +112,23 @@ JOB_STATE = {
     "message": "جاهز",
 }
 
+# Authentication is deliberately event-driven: the browser never polls in a
+# loop and verification codes are held only in RAM until the waiting login
+# callback consumes them.
+AUTH_STATE_LOCK = threading.RLock()
+AUTH_CODE_EVENT = threading.Event()
+AUTH_CODE_VALUE = None
+AUTH_CODE_TIMEOUT_SECONDS = 600
+AUTH_STATE = {
+    "state": "idle",
+    "target_mode": "anonymous",
+    "contact_point": "",
+    "message": "لا توجد عملية Login قيد الانتظار.",
+    "error": "",
+    "started_at": None,
+    "updated_at": None,
+}
+
 # ============================================================
 # 4. Utility helpers
 # ============================================================
@@ -152,6 +169,108 @@ def set_job_state(state, username="", kind="", message=""):
 def get_job_state():
     with JOB_STATE_LOCK:
         return dict(JOB_STATE)
+
+
+def set_auth_state(state, message="", target_mode=None, contact_point=None, error=""):
+    with AUTH_STATE_LOCK:
+        if target_mode is not None:
+            AUTH_STATE["target_mode"] = str(target_mode)
+        if contact_point is not None:
+            AUTH_STATE["contact_point"] = str(contact_point)
+        AUTH_STATE.update({
+            "state": str(state),
+            "message": str(message or ""),
+            "error": str(error or ""),
+            "updated_at": now_iso(),
+        })
+
+
+def get_auth_state():
+    with AUTH_STATE_LOCK:
+        return dict(AUTH_STATE)
+
+
+def submit_login_code(code):
+    global AUTH_CODE_VALUE
+    clean = re.sub(r"\s+", "", str(code or ""))
+    if not (4 <= len(clean) <= 32):
+        return False, "رمز التحقق غير صالح."
+    with AUTH_STATE_LOCK:
+        if AUTH_STATE.get("state") != "waiting_code":
+            return False, "لا يوجد طلب تحقق ينتظر رمزًا الآن."
+        AUTH_CODE_VALUE = clean
+        AUTH_CODE_EVENT.set()
+        AUTH_STATE.update({
+            "state": "verifying",
+            "message": "تم استلام رمز التحقق؛ جارٍ إكمال Login…",
+            "updated_at": now_iso(),
+        })
+    return True, "تم إرسال رمز التحقق إلى جلسة Login الجارية."
+
+
+def cancel_login():
+    with AUTH_STATE_LOCK:
+        pending = AUTH_STATE.get("state") in {
+            "starting", "loading_session", "authenticating",
+            "waiting_code", "verifying"
+        }
+        if not pending:
+            return False, "لا توجد عملية Login جارية."
+        AUTH_STATE.update({
+            "state": "cancelled",
+            "message": "تم إلغاء عملية Login.",
+            "error": "",
+            "updated_at": now_iso(),
+        })
+        AUTH_CODE_EVENT.set()
+    return True, "تم إلغاء Login."
+
+
+def instagram_challenge_callback(ctx):
+    """Bridge instaharvest-v2's email/SMS challenge into the web panel."""
+    global AUTH_CODE_VALUE
+    contact = extract(
+        ctx, "contact_point", "contact", "masked_contact",
+        default="وسيلة التحقق المسجلة"
+    )
+    with AUTH_STATE_LOCK:
+        AUTH_CODE_VALUE = None
+        AUTH_CODE_EVENT.clear()
+    set_auth_state(
+        "waiting_code",
+        f"Instagram طلب رمز تحقق. أدخله من الهاتف/البريد ثم اضغط «إرسال الرمز».",
+        target_mode="login",
+        contact_point=contact,
+    )
+    print(f"🔢 Challenge مطلوب من Instagram عبر: {redact_error(Exception(str(contact)))}")
+    if not AUTH_CODE_EVENT.wait(AUTH_CODE_TIMEOUT_SECONDS):
+        set_auth_state(
+            "error",
+            "انتهت مهلة انتظار رمز التحقق (10 دقائق).",
+            target_mode="login",
+            contact_point=contact,
+            error="verification code timeout",
+        )
+        raise RuntimeError("انتهت مهلة انتظار رمز التحقق.")
+    with AUTH_STATE_LOCK:
+        code = AUTH_CODE_VALUE
+        AUTH_CODE_VALUE = None
+        cancelled = AUTH_STATE.get("state") == "cancelled"
+    if cancelled or not code:
+        set_auth_state(
+            "cancelled",
+            "تم إلغاء انتظار رمز التحقق.",
+            target_mode="login",
+            contact_point=contact,
+        )
+        raise RuntimeError("تم إلغاء عملية Login أثناء انتظار رمز التحقق.")
+    set_auth_state(
+        "verifying",
+        "جارٍ التحقق من رمز Instagram…",
+        target_mode="login",
+        contact_point=contact,
+    )
+    return code
 
 
 def redact_error(exc):
@@ -1264,21 +1383,32 @@ class InstagramClient:
 
     @classmethod
     def get_status(cls):
+        auth = get_auth_state()
+        session_exists = bool(cls._session_file and os.path.exists(cls._session_file))
         job = get_job_state()
+        active_mode = cls._mode
+        pending_mode = auth.get("target_mode") if auth.get("state") not in ("idle", "ready", "error", "cancelled") else active_mode
+        if cls._status == "ready":
+            base_message = f"✅ {cls._mode_label()} — العميل جاهز"
+        elif cls._status == "error":
+            base_message = (
+                f"❌ {cls._mode_label()} — "
+                f"{html_escape(cls._last_error or 'خطأ غير محدد')}"
+            )
+        else:
+            base_message = f"⏳ {cls._mode_label()} — {cls._status}"
         return {
-            "mode": cls._mode,
+            "mode": active_mode,
+            "target_mode": pending_mode,
             "status": cls._status,
             "session_loaded": bool(cls._session_loaded),
+            "session_saved": session_exists,
+            "session_file": cls._session_file or "",
             "throttle_remaining": cls.throttle_remaining(),
             "last_error": cls._last_error,
+            "auth": auth,
             "job": job,
-            "message": (
-                f"✅ {cls._mode_label()} — العميل جاهز"
-                if cls._status == "ready"
-                else f"❌ {cls._mode_label()} — {html_escape(cls._last_error or 'خطأ غير محدد')}"
-                if cls._status == "error"
-                else f"⏳ {cls._mode_label()} — {cls._status}"
-            ),
+            "message": base_message,
         }
 
     @classmethod
@@ -1311,47 +1441,163 @@ class InstagramClient:
     @classmethod
     def _build_anonymous(cls):
         print("🔓 إنشاء عميل Anonymous...")
-        ig = Instagram.anonymous(unlimited=True)
-        return ig
+        return Instagram.anonymous(unlimited=True)
 
     @classmethod
     def _build_login(cls):
-        ig = Instagram()
+        # The library explicitly supports a challenge_callback for email/SMS
+        # verification. The callback is connected to the web panel instead of
+        # blocking the Flask request.
+        ig = Instagram(challenge_callback=instagram_challenge_callback)
 
-        # Reuse the Drive session first. A valid saved session must work
-        # even when username/password are not present in the runtime.
         if cls._session_file and os.path.exists(cls._session_file):
+            set_auth_state(
+                "loading_session",
+                "♻️ تحميل جلسة Login المحفوظة من Google Drive…",
+                target_mode="login",
+            )
             try:
-                print(f"♻️ محاولة تحميل جلسة: {cls._session_file}")
+                print(f"♻️ محاولة تحميل جلسة Login: {cls._session_file}")
                 ig.auth.load_session(cls._session_file)
                 valid = True
                 if hasattr(ig.auth, "validate_session"):
                     validation = ig.auth.validate_session()
                     valid = validation is not False
                 if valid:
-                    print("✅ الجلسة المحفوظة صالحة.")
+                    print("✅ الجلسة المحفوظة صالحة — لا حاجة لإعادة كلمة المرور.")
                     return ig, True
-                print("⚠️ الجلسة المحفوظة غير صالحة؛ سيتم تسجيل الدخول.")
+                print("⚠️ الجلسة المحفوظة غير صالحة؛ سيتم إنشاء Login جديد.")
             except Exception as exc:
+                if is_rate_limit_error(exc):
+                    raise RuntimeError(
+                        "Instagram أعاد 429 أثناء التحقق من الجلسة المحفوظة؛ "
+                        "تم إيقاف Login ولن تتم محاولة كلمة المرور تلقائياً."
+                    )
                 print(f"⚠️ تعذر استخدام الجلسة المحفوظة: {redact_error(exc)}")
 
         if not IG_USERNAME or not IG_PASSWORD:
             raise RuntimeError(
-                "لا توجد جلسة Login صالحة محفوظة، وبيانات IG_USERNAME/IG_PASSWORD "
-                "غير موجودة في بيئة Colab."
+                "لا توجد جلسة Login صالحة محفوظة، وبيانات "
+                "IG_USERNAME/IG_PASSWORD غير موجودة في بيئة Colab."
             )
 
-        print(f"🔐 محاولة Login للحساب: {IG_USERNAME}")
+        set_auth_state(
+            "authenticating",
+            "🔐 جارٍ تسجيل الدخول باسم المستخدم وكلمة المرور…",
+            target_mode="login",
+        )
+        print("🔐 بدء Login للحساب المهيأ في بيئة Colab.")
         result = ig.login(IG_USERNAME, IG_PASSWORD)
         if result is False:
             raise RuntimeError("المكتبة أعادت False من ig.login().")
+
         if cls._session_file:
             try:
+                os.makedirs(os.path.dirname(cls._session_file), exist_ok=True)
                 ig.auth.save_session(cls._session_file)
-                print(f"💾 تم حفظ جلسة Login: {cls._session_file}")
+                print(f"💾 تم حفظ جلسة Login بشكل دائم في Google Drive: {cls._session_file}")
             except Exception as exc:
                 print(f"⚠️ تعذر حفظ الجلسة: {redact_error(exc)}")
+                raise RuntimeError(
+                    "نجح Login لكن تعذر حفظ الجلسة في Google Drive."
+                ) from exc
         return ig, False
+
+    @classmethod
+    def _login_worker(cls, previous_ig, previous_mode,
+                      previous_status, previous_session_loaded):
+        try:
+            ig, session_loaded = cls._build_login()
+            with CLIENT_SWITCH_LOCK:
+                cls._ig = ig
+                cls._mode = "login"
+                cls._status = "ready"
+                cls._session_loaded = session_loaded
+                cls._last_error = ""
+            set_auth_state(
+                "ready",
+                (
+                    "✅ Login جاهز باستخدام الجلسة المحفوظة."
+                    if session_loaded
+                    else "✅ تم تسجيل الدخول وحفظ الجلسة في Google Drive."
+                ),
+                target_mode="login",
+            )
+            set_job_state("done", "", "login", "Login جاهز")
+            print("✅ تم تفعيل Login فعلياً.")
+        except Exception as exc:
+            cancelled = get_auth_state().get("state") == "cancelled"
+            with CLIENT_SWITCH_LOCK:
+                cls._ig = previous_ig
+                cls._mode = previous_mode
+                cls._status = previous_status if previous_ig is not None else "error"
+                cls._session_loaded = previous_session_loaded
+                cls._last_error = redact_error(exc)
+                if is_rate_limit_error(exc):
+                    cls._last_throttle_at = time.time()
+            if cancelled:
+                set_auth_state(
+                    "cancelled",
+                    "تم إلغاء Login؛ بقي الوضع السابق فعالاً.",
+                    target_mode="login",
+                )
+                set_job_state("done", "", "login", "تم إلغاء Login")
+            else:
+                set_auth_state(
+                    "error",
+                    "❌ فشل Login. راجع تفاصيل الخطأ ثم أعد المحاولة فقط عند الحاجة.",
+                    target_mode="login",
+                    error=redact_error(exc),
+                )
+                set_job_state("error", "", "login", redact_error(exc))
+            print(f"❌ Login: {redact_error(exc)}")
+            traceback.print_exc()
+        finally:
+            with CLIENT_SWITCH_LOCK:
+                cls._login_thread = None
+            INSTAGRAM_JOB_LOCK.release()
+
+    @classmethod
+    def start_login(cls):
+        with CLIENT_SWITCH_LOCK:
+            if cls._mode == "login" and cls._ig is not None and cls._status == "ready":
+                return cls.get_status()
+
+            auth_state = get_auth_state()
+            if auth_state.get("state") in {
+                "starting", "loading_session", "authenticating",
+                "waiting_code", "verifying"
+            }:
+                return cls.get_status()
+
+            if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+                raise RuntimeError(
+                    "لا يمكن بدء Login أثناء تنفيذ سكراب/بحث آخر."
+                )
+
+            previous_ig = cls._ig
+            previous_mode = cls._mode
+            previous_status = cls._status
+            previous_session_loaded = cls._session_loaded
+            cls._login_thread = True
+
+            set_auth_state(
+                "starting",
+                "⏳ تم بدء Login في الخلفية. اضغط «تحديث الحالة» عند الحاجة.",
+                target_mode="login",
+            )
+            set_job_state("starting", "", "login", "بدء عملية Login")
+
+            thread = threading.Thread(
+                target=cls._login_worker,
+                args=(
+                    previous_ig, previous_mode,
+                    previous_status, previous_session_loaded
+                ),
+                daemon=True,
+            )
+            thread.start()
+            return cls.get_status()
 
     @classmethod
     def switch_mode(cls, requested_mode):
@@ -1359,52 +1605,46 @@ class InstagramClient:
         if requested_mode not in ("anonymous", "login"):
             raise ValueError("الوضع يجب أن يكون anonymous أو login")
 
+        if requested_mode == "login":
+            return cls.start_login()
+
+        if get_auth_state().get("state") in {
+            "starting", "loading_session", "authenticating",
+            "waiting_code", "verifying"
+        }:
+            raise RuntimeError(
+                "Login ما زال قيد التنفيذ؛ أكمل رمز التحقق أو اضغط «إلغاء Login» أولاً."
+            )
+
         if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
             raise RuntimeError("لا يمكن تبديل الوضع أثناء تنفيذ مهمة سكراب/بحث.")
 
         try:
             with CLIENT_SWITCH_LOCK:
                 old_ig = cls._ig
-                old_mode = cls._mode
-                old_status = cls._status
-                old_session_loaded = cls._session_loaded
-
                 try:
                     cls._status = "switching"
                     cls._last_error = ""
-
-                    if requested_mode == "anonymous":
-                        new_ig = cls._build_anonymous()
-                        new_session_loaded = False
-                    else:
-                        new_ig, new_session_loaded = cls._build_login()
-
-                    # Atomic commit: replace the active client only after
-                    # the requested mode has actually initialized.
-                    cls._ig = new_ig
-                    cls._mode = requested_mode
+                    cls._ig = cls._build_anonymous()
+                    cls._mode = "anonymous"
+                    cls._session_loaded = False
                     cls._status = "ready"
-                    cls._session_loaded = new_session_loaded
-                    print(f"✅ تم تفعيل {cls._mode_label()}")
+                    set_auth_state(
+                        "ready",
+                        "✅ Anonymous جاهز.",
+                        target_mode="anonymous",
+                    )
+                    print("✅ تم تفعيل Anonymous.")
                     return cls.get_status()
-
                 except Exception as exc:
-                    # Never silently fall back to Anonymous. Preserve the
-                    # previously working client so a failed Login is visible.
                     cls._ig = old_ig
-                    cls._mode = old_mode
-                    cls._status = old_status if old_ig is not None else "error"
-                    cls._session_loaded = old_session_loaded
+                    cls._status = "ready" if old_ig is not None else "error"
                     cls._last_error = redact_error(exc)
-                    if is_rate_limit_error(exc):
-                        cls._last_throttle_at = time.time()
-                    low = cls._last_error.lower()
-                    if "challenge" in low or "checkpoint" in low or "verification" in low:
-                        cls._last_challenge_at = time.time()
-
-                    print(
-                        f"❌ فشل تفعيل {requested_mode}; "
-                        f"الوضع الحالي بقي {cls._mode_label()}: {cls._last_error}"
+                    set_auth_state(
+                        "error",
+                        "فشل تفعيل Anonymous.",
+                        target_mode="anonymous",
+                        error=redact_error(exc),
                     )
                     raise
         finally:
@@ -1422,14 +1662,31 @@ class InstagramClient:
                 if cls._mode == "anonymous":
                     cls._ig = cls._build_anonymous()
                     cls._session_loaded = False
+                    set_auth_state(
+                        "ready",
+                        "✅ Anonymous جاهز.",
+                        target_mode="anonymous",
+                    )
                 else:
                     cls._ig, cls._session_loaded = cls._build_login()
+                    cls._status = "ready"
+                    set_auth_state(
+                        "ready",
+                        "✅ Login جاهز.",
+                        target_mode="login",
+                    )
                 cls._status = "ready"
                 cls._last_error = ""
                 return cls._ig
             except Exception as exc:
                 cls._ig = None
                 cls._set_error(exc)
+                set_auth_state(
+                    "error",
+                    "فشل تهيئة عميل Instagram.",
+                    target_mode=cls._mode,
+                    error=redact_error(exc),
+                )
                 print(f"❌ إنشاء عميل Instagram: {redact_error(exc)}")
                 return None
 
@@ -1443,6 +1700,7 @@ class InstagramClient:
             )
             return False
         return True
+
 
 
 # ============================================================
@@ -2987,7 +3245,23 @@ button:disabled{opacity:.55;cursor:not-allowed}
 <button id="applyMode">تفعيل الوضع المحدد</button>
 <button id="refreshStatus" class="gray">تحديث الحالة</button>
 </div>
-<div id="statusBox" class="badge">جارٍ قراءة الحالة…</div>
+<div id="statusBox" class="badge">اضغط «تحديث الحالة» لمعرفة الحالة الحالية</div>
+
+<div id="authPanel" class="section" style="display:none">
+<div class="title">🔢 رمز التحقق من Instagram</div>
+<div id="authMessage" class="small" style="margin-bottom:8px"></div>
+<div class="row">
+<input type="text" id="verificationCode" inputmode="numeric" autocomplete="one-time-code"
+       placeholder="أدخل رمز البريد/الهاتف">
+<button id="submitCode" class="secondary">إرسال الرمز</button>
+</div>
+<div class="row" style="margin-top:7px">
+<button id="cancelLogin" class="gray" type="button">إلغاء Login</button>
+</div>
+<div class="small" style="margin-top:7px">
+الرمز لا يُحفظ في Google Drive أو GitHub؛ يبقى في الذاكرة فقط حتى يستلمه Login.
+</div>
+</div>
 </div>
 
 <div class="tabs">
@@ -3076,17 +3350,38 @@ function paintMode(mode){
 function renderStatus(data){
   const box=document.getElementById('statusBox');
   box.className='badge '+(data.status==='ready'?'ok':(data.status==='error'?'err':'wait'));
-  let text=data.message || (data.status||'');
-  if(data.session_loaded) text += ' · جلسة محفوظة';
-  if(data.throttle_remaining>0) text += ' · تهدئة '+data.throttle_remaining+'s';
+  const auth=data.auth||{};
+  let msg=data.message || (data.status||'');
+  if(auth.message) msg += ' · '+auth.message;
+  if(auth.contact_point) msg += ' · '+auth.contact_point;
+  if(data.session_loaded || data.session_saved) msg += ' · جلسة Drive موجودة';
+  if(data.throttle_remaining>0) msg += ' · تهدئة '+data.throttle_remaining+'s';
   if(data.job && data.job.state==='running'){
-    text += ' · مهمة: '+(data.job.username||'');
+    msg += ' · مهمة: '+(data.job.username||'');
   }
-  box.textContent=text;
-  if(data.mode) {
-    document.querySelector('input[name="mode"][value="'+data.mode+'"]').checked=true;
-    paintMode(data.mode);
+  box.textContent=msg;
+
+  const visualMode =
+    (['starting','loading_session','authenticating','waiting_code','verifying'].includes(auth.state)
+      ? 'login' : (data.mode||'anonymous'));
+  document.querySelectorAll('.mode-box').forEach(x=>x.classList.remove('active'));
+  const selected=document.querySelector('input[name="mode"][value="'+visualMode+'"]');
+  if(selected){ selected.checked=true; paintMode(visualMode); }
+
+  const panel=document.getElementById('authPanel');
+  const authMessage=document.getElementById('authMessage');
+  const waiting=auth.state==='waiting_code';
+  if(panel){
+    panel.style.display=(waiting || auth.state==='verifying')?'block':'none';
   }
+  if(authMessage){
+    authMessage.textContent=waiting
+      ? ((auth.message||'أدخل الرمز المرسل من Instagram.') +
+         (auth.contact_point ? ' · جهة التحقق: '+auth.contact_point : ''))
+      : (auth.message||'');
+  }
+  const submit=document.getElementById('submitCode');
+  if(submit) submit.disabled=!waiting;
 }
 
 async function refreshStatus(){
@@ -3125,6 +3420,38 @@ document.getElementById('applyMode').addEventListener('click',async()=>{
 
 document.getElementById('refreshStatus').addEventListener('click',refreshStatus);
 
+document.getElementById('submitCode').addEventListener('click',async()=>{
+  const input=document.getElementById('verificationCode');
+  const btn=document.getElementById('submitCode');
+  const code=(input.value||'').trim();
+  if(!code) return;
+  btn.disabled=true;
+  try{
+    const body=new URLSearchParams({code});
+    const r=await fetch('/auth/code',{method:'POST',body});
+    const data=await r.json();
+    renderStatus(data);
+    if(!r.ok) alert(data.error || data.message || 'لم يتم قبول الرمز');
+    else input.value='';
+  }catch(err){
+    alert('تعذر إرسال رمز التحقق');
+  }finally{
+    const auth=(window.__lastAuthState||{});
+    btn.disabled=false;
+  }
+});
+
+document.getElementById('cancelLogin').addEventListener('click',async()=>{
+  try{
+    const r=await fetch('/auth/cancel',{method:'POST'});
+    const data=await r.json();
+    renderStatus(data);
+    if(!r.ok) alert(data.error || data.message || 'تعذر إلغاء Login');
+  }catch(err){
+    alert('تعذر إلغاء Login');
+  }
+});
+
 document.getElementById('scrapeForm').addEventListener('submit',async(e)=>{
   e.preventDefault();
   const btn=document.getElementById('scrapeBtn');
@@ -3153,7 +3480,8 @@ document.getElementById('searchForm').addEventListener('submit',async(e)=>{
   finally{btn.disabled=false;btn.textContent='🔍 تنفيذ البحث';}
 });
 
-refreshStatus();
+// لا يوجد أي طلب تلقائي عند فتح الصفحة؛ كل تحديث للحالة يدوي.
+// هذا يمنع مئات طلبات /status المتكررة داخل خلية Colab.
 </script>
 </body>
 </html>"""
@@ -3187,12 +3515,23 @@ def mode_switch():
         return jsonify({"error": "mode must be anonymous or login"}), 400
 
     try:
-        # This is intentionally synchronous: one request, no infinite polling.
         status_data = InstagramClient.switch_mode(requested)
+        pending_login = (
+            requested == "login"
+            and status_data.get("auth", {}).get("state") in {
+                "starting", "loading_session", "authenticating",
+                "waiting_code", "verifying"
+            }
+        )
         return jsonify({
             **status_data,
             "ok": True,
-            "message": f"✅ تم تفعيل {status_data['mode']}",
+            "pending": pending_login,
+            "message": (
+                "⏳ بدأ Login في الخلفية. اضغط «تحديث الحالة» عند طلب الرمز."
+                if pending_login
+                else f"✅ تم تفعيل {status_data['mode']}"
+            ),
         })
     except Exception as exc:
         current = InstagramClient.get_status()
@@ -3207,9 +3546,56 @@ def mode_switch():
         }), 409
 
 
+@app.route("/auth/code", methods=["POST"])
+def auth_code():
+    body = request.get_json(silent=True) or request.form
+    ok, message = submit_login_code(body.get("code", ""))
+    if not ok:
+        current = api_status(message)
+        return jsonify({
+            **current,
+            "ok": False,
+            "error": message,
+        }), 409
+    return jsonify({
+        **api_status(message),
+        "ok": True,
+    })
+
+
+@app.route("/auth/cancel", methods=["POST"])
+def auth_cancel():
+    ok, message = cancel_login()
+    if not ok:
+        current = api_status(message)
+        return jsonify({
+            **current,
+            "ok": False,
+            "error": message,
+        }), 409
+    return jsonify({
+        **api_status(message),
+        "ok": True,
+    })
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
+
 @app.route("/start", methods=["POST"])
 def start_scrape():
     username = str(request.form.get("username", "")).strip()
+    if get_auth_state().get("state") in {
+        "starting", "loading_session", "authenticating",
+        "waiting_code", "verifying"
+    }:
+        return jsonify({
+            "ok": False,
+            "error": "Login ما زال قيد التهيئة. أكمل رمز التحقق أولاً ثم ابدأ السكراب.",
+            "auth": get_auth_state(),
+        }), 409
     if not username:
         return jsonify({"ok": False, "error": "اسم المستخدم مطلوب."}), 400
 
@@ -3263,6 +3649,15 @@ def start_scrape():
 @app.route("/search", methods=["POST"])
 def start_search():
     query = str(request.form.get("query", "")).strip()
+    if get_auth_state().get("state") in {
+        "starting", "loading_session", "authenticating",
+        "waiting_code", "verifying"
+    }:
+        return jsonify({
+            "ok": False,
+            "error": "Login ما زال قيد التهيئة. أكمل المصادقة أولاً.",
+            "auth": get_auth_state(),
+        }), 409
     if not query:
         return jsonify({"ok": False, "error": "الاستعلام مطلوب."}), 400
 
@@ -3328,8 +3723,8 @@ print("   🔓 Anonymous: profile + posts + reels + public search")
 print("   🔐 Login: saved session + Stories + Followers + Following")
 print("   📌 Highlights + comments + cumulative SQLite + CSV/HTML")
 print("   🔎 Search + optional Mention Hunter")
-print("   🔁 Mode switch: atomic, no automatic fallback after failed Login")
-print("   🌐 Control panel: no continuous /status polling")
+print("   🔁 Anonymous/Login switch: Login runs in background with manual status refresh")
+print("   🌐 Control panel: zero automatic polling; status/code actions are manual")
 
 if not os.getenv("NGROK_AUTH_TOKEN") and NGROK_AUTH_TOKEN:
     os.environ["NGROK_AUTH_TOKEN"] = NGROK_AUTH_TOKEN
