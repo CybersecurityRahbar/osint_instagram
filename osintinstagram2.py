@@ -18,11 +18,21 @@
 # ============================================================
 import os
 
+# ------------------------------------------------------------
+# Visible configuration block
+# ------------------------------------------------------------
+# Keep real credentials OUT of the public GitHub repository.
+# Put their values into these Colab environment variables instead.
 NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN", "")
 IG_USERNAME = os.getenv("IG_USERNAME", "")
 IG_PASSWORD = os.getenv("IG_PASSWORD", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Fixed ngrok development domain.
+# This must be the development domain assigned to your ngrok account.
+# The program intentionally does NOT fall back to a random domain.
+NGROK_DOMAIN = "yin-spender-percent.ngrok-free.dev"
 
 # A fresh control token is generated per Colab runtime unless explicitly
 # supplied as an environment variable. It is never stored in Drive/GitHub.
@@ -3822,13 +3832,30 @@ else:
 
 PORT = 5000
 try:
-    tunnel = ngrok.connect(PORT, bind_tls=True)
-except TypeError:
-    tunnel = ngrok.connect(PORT)
+    # Use the account's fixed development domain. Do not silently fall back
+    # to ngrok.connect(PORT) because that would change the public URL.
+    try:
+        tunnel = ngrok.connect(
+            PORT,
+            domain=NGROK_DOMAIN,
+            bind_tls=True,
+        )
+    except TypeError:
+        tunnel = ngrok.connect(
+            PORT,
+            domain=NGROK_DOMAIN,
+        )
+except Exception as exc:
+    print(f"❌ تعذر فتح نطاق ngrok الثابت: {redact_error(exc)}")
+    print(f"   النطاق المطلوب: https://{NGROK_DOMAIN}")
+    raise RuntimeError(
+        "لم يتم فتح ngrok لأن النطاق الثابت غير متاح لهذا الحساب/الجلسة. "
+        "لن يتم إنشاء رابط عشوائي بديل."
+    ) from exc
 
 PUBLIC_URL = getattr(tunnel, "public_url", str(tunnel))
 print("=" * 70)
-print(f"🌐 Control Panel: {PUBLIC_URL}")
+print(f"🌐 Control Panel: https://{NGROK_DOMAIN}")
 print("=" * 70)
 print("✅ لا يوجد polling مستمر لـ /status.")
 print("✅ تبديل Anonymous/Login يتم في طلب واحد.")
