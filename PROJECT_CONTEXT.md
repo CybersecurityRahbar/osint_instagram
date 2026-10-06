@@ -305,3 +305,40 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Follower names are sent in numbered groups of 20, preserving all requested entries without Telegram's 4096-character truncation.
 - The old browser Session ID code path remains disabled.
 
+## 2026-10-06 — اكتشاف السبب الفعلي لفشل legacy_first وتغييره إلى Legacy مباشر
+
+### دليل التشغيل الذي قدمه المستخدم
+- في Google Colab، بعد تثبيت `instagrapi 3.0.20` وتشغيل النسخة الحالية، ظهرت:
+  `Status 429: Too many requests`
+  ثم رسالة الأداة: `Instagram أعاد 429 من CAA أثناء تسجيل الدخول`.
+- المستخدم استخدم حساب Instagram جديد مخصص للأداة واسم المستخدم/كلمة المرور، ولم توجد جلسة محفوظة بعد.
+
+### السبب المؤكد من مصدر instagrapi 3.0.20
+- مراجعة `instagrapi 3.0.20` أظهرت أن `Client.login_legacy()` يبدأ من `accounts/login/`، لكن عند استجابة `BadPassword` بدون سياق 2FA يستدعي `_try_caa_login()`.
+- كما أن `UnknownError` من نوع `needs_upgrade` يؤدي أيضًا إلى `_try_caa_login()`.
+- لذلك إعداد المشروع `LOGIN_STRATEGY = legacy_first` لم يكن Legacy فقط بصورة صارمة؛ كان يسمح للمكتبة نفسها بالانتقال إلى CAA.
+- هذا يفسر ظهور CAA في سجل المستخدم رغم أن الأداة كانت تستدعي `login_legacy()`.
+
+### التغيير في 2026-10-06
+- تغيير الاستراتيجية إلى `LOGIN_STRATEGY = strict_legacy`.
+- إضافة `_strict_legacy_password_login()` داخل `osintinstagram.py`.
+- التدفق الجديد للدخول الأول: `pre_login_flow` → `accounts/login/` → استخراج authorization → `login_flow` → حفظ جلسة الأداة.
+- إذا أعاد `pre_login_flow` خطأ 429، يستمر التدفق مثل login القديم بدلاً من الانتقال إلى CAA.
+- لا يوجد CAA fallback في هذا المسار.
+- 2FA يستخدم `accounts/two_factor_login/` مباشرة في هذا المسار، ولا يُحوَّل تلقائيًا إلى Bloks/CAA.
+- عند نجاح الدخول، تُحفظ إعدادات الجلسة المملوكة للأداة في Google Drive: `/content/drive/MyDrive/ig_tool_session_legacy_v3.json`.
+- عند 429 في النسخة الجديدة، الرسالة تذكر صراحة أن 429 من `pre_login` أو `accounts/login`، وليس CAA.
+
+### ماذا سيحسم الاختبار القادم
+- إذا نجح `accounts/login/`: تم فعليًا استرجاع مسار كلمة المرور القديم وإنشاء جلسة مستقلة للأداة.
+- إذا عاد 429 من `accounts/login/`: المشكلة ليست CAA؛ تكون في قبول Instagram نفسه لإنشاء جلسة جديدة من بيئة Colab، وسجل الخطأ الجديد سيكشف المرحلة بدقة.
+- إذا ظهر `needs_upgrade` أو رفض مشابه من `accounts/login/`: سيظهر الآن الخطأ الأصلي بدلاً من إخفائه خلف CAA.
+- إذا نجح أول دخول، يجب إعادة استخدام ملف الجلسة وعدم تنفيذ password login في كل تشغيل.
+
+### ملاحظة مهمة
+- هذا التغيير لا ينسخ Session ID من المتصفح ولا يحاول تجاوز تحدي Instagram أو 429.
+- لا يوجد ضمان أن Instagram سيقبل إنشاء جلسة جديدة من Colab؛ الهدف هنا إزالة التحويل الخفي إلى CAA واستعادة السلوك القديم الذي كان المستخدم يريده، مع تشخيص صريح للرد الحقيقي من endpoint القديم.
+
+### قاعدة البيانات
+- لا تغيير في مسار قاعدة البيانات أو حذف السجلات.
+- النسخة الاحتياطية التلقائية قبل migrations ما زالت مفعلة.
