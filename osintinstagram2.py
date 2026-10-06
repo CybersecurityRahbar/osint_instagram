@@ -177,6 +177,8 @@ def set_auth_state(state, message="", target_mode=None, contact_point=None, erro
             AUTH_STATE["target_mode"] = str(target_mode)
         if contact_point is not None:
             AUTH_STATE["contact_point"] = str(contact_point)
+        if state in {"starting", "loading_session", "authenticating"} and not AUTH_STATE.get("started_at"):
+            AUTH_STATE["started_at"] = now_iso()
         AUTH_STATE.update({
             "state": str(state),
             "message": str(message or ""),
@@ -242,7 +244,7 @@ def instagram_challenge_callback(ctx):
         target_mode="login",
         contact_point=contact,
     )
-    print(f"🔢 Challenge مطلوب من Instagram عبر: {redact_error(Exception(str(contact)))}")
+    print("🔢 Instagram طلب رمز تحقق؛ انتظر ظهور طلب الرمز ثم أدخله من الواجهة.")
     if not AUTH_CODE_EVENT.wait(AUTH_CODE_TIMEOUT_SECONDS):
         set_auth_state(
             "error",
@@ -3436,7 +3438,6 @@ document.getElementById('submitCode').addEventListener('click',async()=>{
   }catch(err){
     alert('تعذر إرسال رمز التحقق');
   }finally{
-    const auth=(window.__lastAuthState||{});
     btn.disabled=false;
   }
 });
