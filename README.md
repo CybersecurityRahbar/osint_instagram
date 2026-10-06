@@ -19,7 +19,7 @@ It keeps the tested Anonymous public-data path separate from the authenticated L
 
 ### Runtime variables
 
-Use these only in the Colab runtime/Secrets area, never in GitHub:
+Use these only in the Colab runtime/Secrets area, never in GitHub. The configuration names remain visible at the top of `osintinstagram2.py`, but real secret values are not committed:
 
        import os
        os.environ['NGROK_AUTH_TOKEN'] = '...'
