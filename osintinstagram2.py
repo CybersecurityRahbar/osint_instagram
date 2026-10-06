@@ -3323,7 +3323,7 @@ button:disabled{opacity:.55;cursor:not-allowed}
 <div id="authMessage" class="small" style="margin-bottom:8px"></div>
 <div class="row">
 <input type="text" id="verificationCode" inputmode="numeric" autocomplete="one-time-code"
-       placeholder="أدخل رمز البريد/الهاتف" disabled>
+       placeholder="أدخل رمز البريد/الهاتف">
 <button id="submitCode" class="secondary" disabled>إرسال الرمز</button>
 </div>
 <div class="row" style="margin-top:7px">
@@ -3331,8 +3331,8 @@ button:disabled{opacity:.55;cursor:not-allowed}
 </div>
 <div class="small" style="margin-top:7px">
 الرمز لا يُحفظ في Google Drive أو GitHub؛ يبقى في الذاكرة فقط حتى يستلمه Login.
-بعد ضغط «تفعيل Login»، استخدم «تحديث الحالة» يدويًا مرة واحدة عندما يصل الرمز؛
-عند ظهور حالة «بانتظار الرمز» ستصبح الخانة مفعلة.
+يمكنك لصق الرمز في الخانة فور وصوله. زر «إرسال الرمز» يصبح فعالًا عندما تصل حالة Login إلى «بانتظار الرمز».
+استخدم «تحديث الحالة» يدويًا بعد وصول الرمز.
 </div>
 </div>
 </div>
@@ -3466,8 +3466,11 @@ function renderStatus(data){
   const codeInput=document.getElementById('verificationCode');
   if(submit) submit.disabled=!waiting;
   if(codeInput){
-    codeInput.disabled=!waiting;
-    codeInput.setAttribute('aria-disabled',String(!waiting));
+    codeInput.disabled=false;
+    codeInput.setAttribute('aria-disabled',String(false));
+    codeInput.title=waiting
+      ? 'أدخل رمز Instagram ثم اضغط إرسال الرمز'
+      : 'يمكنك كتابة الرمز مسبقًا؛ سيُرسل فقط عندما تكون حالة Login waiting_code';
   }
   if(waiting && codeInput){
     try{
