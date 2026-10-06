@@ -552,11 +552,27 @@ def save_post_if_not_exists(account_username, media, media_type=None, file_path=
         conn.close()
         return None
 
-    c.execute("SELECT id FROM posts WHERE post_code=?", (code,))
+    c.execute("SELECT id, file_path, downloaded FROM posts WHERE post_code=?", (code,))
     existing = c.fetchone()
     if existing:
         post_id = existing[0]
-        conn.close()
+        taken = _extract(media, 'taken_at', default=None)
+        taken_str = taken.isoformat() if hasattr(taken, 'isoformat') else (str(taken) if taken else None)
+        c.execute('''UPDATE posts SET
+            post_url=?, media_type=COALESCE(?, media_type), caption=?,
+            like_count=?, comment_count=?, view_count=?, play_count=?,
+            taken_at=?, thumbnail_url=?
+            WHERE id=?''',
+            (f"https://www.instagram.com/p/{code}/", media_type,
+             str(_extract(media, 'caption_text', 'caption', default='')),
+             int(_extract(media, 'like_count', 'likes', default=0) or 0),
+             int(_extract(media, 'comment_count', 'comments', default=0) or 0),
+             int(_extract(media, 'view_count', 'views', default=0) or 0),
+             int(_extract(media, 'play_count', 'plays', default=0) or 0),
+             taken_str,
+             str(_extract(media, 'thumbnail_url', 'display_url', default='')),
+             post_id))
+        conn.commit(); conn.close()
         return post_id
 
     thumb_url = str(_extract(media, 'thumbnail_url', 'display_url', default=''))
@@ -629,6 +645,59 @@ def save_story(account_id, story, file_path, story_url=""):
         print(f"      ⚠️ DB save_story: {e}")
         return False
 
+def save_highlight_record(account_id, highlight, cover_path=""):
+    try:
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        pk = str(_extract(highlight, 'pk', 'id', default=''))
+        title = str(_extract(highlight, 'title', 'name', default=''))
+        count = int(_extract(highlight, 'media_count', 'item_count', default=0) or 0)
+        cover = str(_extract(highlight, 'cover_url', 'thumbnail_url', default='') or '')
+        c.execute('''INSERT INTO highlights
+            (account_id, highlight_pk, title, media_count, cover_url, cover_path, downloaded)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(highlight_pk) DO UPDATE SET
+                title=excluded.title,
+                media_count=excluded.media_count,
+                cover_url=excluded.cover_url,
+                cover_path=excluded.cover_path,
+                downloaded=excluded.downloaded''',
+            (account_id, pk, title, count, cover, cover_path, 1 if cover_path else 0))
+        hid = c.execute("SELECT id FROM highlights WHERE highlight_pk=?", (pk,)).fetchone()[0]
+        conn.commit(); conn.close()
+        return hid
+    except Exception as e:
+        print(f"      ⚠️ save_highlight: {type(e).__name__}: {str(e)[:120]}")
+        try: conn.close()
+        except Exception: pass
+        return None
+
+def save_highlight_item_record(highlight_id, item, file_path=""):
+    try:
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        pk = str(_extract(item, 'pk', 'id', default=''))
+        media_type = 'video' if _extract(item, 'video_url', default='') else 'image'
+        taken = _extract(item, 'taken_at', default=None)
+        taken_str = taken.isoformat() if hasattr(taken, 'isoformat') else (str(taken) if taken else None)
+        video_url = str(_extract(item, 'video_url', default='') or '')
+        c.execute('''INSERT INTO highlight_items
+            (highlight_id, item_pk, media_type, taken_at, file_path, video_url, downloaded)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(item_pk) DO UPDATE SET
+                highlight_id=excluded.highlight_id,
+                media_type=excluded.media_type,
+                taken_at=excluded.taken_at,
+                file_path=excluded.file_path,
+                video_url=excluded.video_url,
+                downloaded=excluded.downloaded''',
+            (highlight_id, pk, media_type, taken_str, file_path, video_url, 1 if file_path else 0))
+        conn.commit(); conn.close()
+        return True
+    except Exception as e:
+        print(f"      ⚠️ save_highlight_item: {type(e).__name__}: {str(e)[:120]}")
+        try: conn.close()
+        except Exception: pass
+        return False
+
 def get_account_id(username):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT id FROM accounts WHERE username=?", (username,))
@@ -691,6 +760,17 @@ def get_stories(account_id):
     c = conn.cursor()
     c.execute("SELECT * FROM stories WHERE account_id=? ORDER BY taken_at DESC", (account_id,))
     s = [dict(r) for r in c.fetchall()]; conn.close(); return s
+
+def get_highlights(account_id):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM highlights WHERE account_id=? ORDER BY title ASC", (account_id,))
+    rows = [dict(r) for r in c.fetchall()]
+    for h in rows:
+        c.execute("SELECT * FROM highlight_items WHERE highlight_id=? ORDER BY taken_at ASC", (h['id'],))
+        h['items'] = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
 
 def save_mention(query, source_type, source_pk, source_url, context,
                  mentioned_username="", mentioned_full_name=""):
@@ -1689,6 +1769,7 @@ class InstagramSearcher:
                 for hi, highlight in enumerate(highlights,1):
                     title = str(_extract(highlight,'title','name',default=f'Highlight {hi}'))
                     items = _extract(highlight,'items','stories',default=[]) or []
+                    highlight_id = save_highlight_record(aid, highlight)
                     TelegramSender.send_rich_message(
                         f"<b>📌 Highlight #{hi}</b> — {html_escape(title)}\n"
                         f"👤 @{html_escape(username)}\n📦 {len(items)} عنصر"
@@ -1697,6 +1778,7 @@ class InstagramSearcher:
                         fp = self._download_highlight_item(item,hf,i)
                         if not fp: continue
                         total_hi += 1
+                        save_highlight_item_record(highlight_id, item, fp)
                         if fp.lower().endswith(('.mp4','.mov','.webm')):
                             TelegramSender.send_video(fp,f"<b>📌 {html_escape(title)}</b> — {i}")
                         else:
@@ -1750,6 +1832,7 @@ class InstagramSearcher:
             posts = get_posts_with_comments(aid, order=order)
             fl = get_followers(aid)
             stories = get_stories(aid)
+            highlights = get_highlights(aid)
 
             pic_b64 = ""
             pp = os.path.join(MEDIA_PATH, username, "profile_pic.jpg")
