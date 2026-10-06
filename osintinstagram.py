@@ -16,6 +16,13 @@ IG_PASSWORD = "كلمة المرور "
 # لذلك تستخدم الأداة هنا تدفق accounts/login مباشرة ولا تستدعي CAA تلقائياً.
 LOGIN_STRATEGY = "strict_legacy"
 PRIVATE_TRANSPORT_FOR_LOGIN = "requests"
+
+# أحدث ملف تطبيق Android وجدناه وقت بناء هذه النسخة.
+# 450.0.0.50.77 ظهر كأحدث إصدار بتاريخ 2026-10-05، بينما
+# instagrapi 3.0.20 ما زال يحمل profile افتراضياً لـ 449.
+# نستخدمه فقط لمسار password/legacy المباشر؛ لا نحتاج Bloks ID لهذا المسار.
+LEGACY_APP_VERSION = "450.0.0.50.77"
+LEGACY_APP_VERSION_CODE = "385611438"
 TELEGRAM_TOKEN = "توكن تيلجرام"
 TELEGRAM_CHAT_ID = "معرف تلجرام "
 
@@ -1030,6 +1037,27 @@ class InstagramClient:
 
 
     @classmethod
+    def _apply_strict_legacy_app_profile(cls, client):
+        """تحديث app_version/version_code لمسار accounts/login المباشر."""
+        if LOGIN_STRATEGY != "strict_legacy":
+            return client
+        try:
+            client.set_device({
+                "app_version": LEGACY_APP_VERSION,
+                "version_code": LEGACY_APP_VERSION_CODE,
+            })
+            print(
+                f"📱 Instagram app profile: {LEGACY_APP_VERSION} "
+                f"(code {LEGACY_APP_VERSION_CODE})"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "تعذر تطبيق ملف Instagram Android الحالي على عميل Legacy: "
+                f"{type(e).__name__}: {str(e)[:180]}"
+            ) from e
+        return client
+
+    @classmethod
     def _strict_legacy_password_login(cls, client):
         """
         Legacy password login مباشر، بدون CAA fallback.
@@ -1144,12 +1172,14 @@ class InstagramClient:
         # 1) الجلسة المحفوظة هي المسار الأول والأكثر أماناً للـrate limit
         client = None
         client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
+        client = cls._apply_strict_legacy_app_profile(client)
         session_loaded = False
 
         if os.path.exists(cls._SESSION_FILE):
             try:
                 client.load_settings(cls._SESSION_FILE, override_app_version=True)
                 cls._configure_client(client, legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
+                client = cls._apply_strict_legacy_app_profile(client)
                 session_loaded = True
                 print("♻️ تم تحميل الجلسة المحفوظة مع ترقية ملف app profile")
 
@@ -1177,6 +1207,7 @@ class InstagramClient:
             except Exception as e:
                 print(f"⚠️ تعذر تحميل الجلسة المحفوظة: {type(e).__name__}: {str(e)[:160]}")
                 client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
+                client = cls._apply_strict_legacy_app_profile(client)
 
         if not session_loaded:
             print("ℹ️ لا توجد جلسة محفوظة — سيتم تنفيذ محاولة دخول واحدة فقط بكلمة المرور")
