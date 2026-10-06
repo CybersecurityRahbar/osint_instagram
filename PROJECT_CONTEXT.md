@@ -438,3 +438,46 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - أعيد تنزيل Anonymous إلى المسار المباشر من `video_url/display_url/thumbnail_url` الذي كان مستخدماً في النسخة الأصلية.
 - Reels وStories وHighlights وFollowers وFollowing أصبحت طبقات مستقلة ولا تمنع معالجة المنشورات الأساسية.
 - لم يتم حذف أي ميزة Login التي سبق إضافتها؛ Login session switching ما زال موجوداً.
+
+## 2026-10-06 — Comprehensive audit: asynchronous Login + email/SMS verification + zero automatic polling
+
+### User-reported issues
+- The current repository version was incomplete from the user's perspective and contained runtime errors.
+- Opening the ngrok control panel produced repeated HTTP 200 requests in the Colab cell until a scrape/search was started.
+- Selecting Login from the control panel did not reliably activate the Login client.
+- Instagram sends a verification code to the user's phone/email during authentication, but the tool had no web-based place to enter that code.
+- The authenticated session must persist in Google Drive and be reused for later requests/searches instead of asking for Login every time.
+
+### Root causes found in osintinstagram2.py
+1. Login switching was synchronous inside the /mode HTTP request. A verification challenge could block or fail the request before a user could provide a code.
+2. There was no bridge between instaharvest-v2's supported challenge_callback and the web control panel.
+3. The UI still invoked refreshStatus() once when the page loaded; the revised implementation removes even that automatic status request so page-open activity is not a source of repeated /status traffic.
+4. The UI did not have a robust state model for an in-progress Login challenge.
+
+### Changes committed
+- Login is now an asynchronous background operation.
+- The active Anonymous client is preserved until Login actually succeeds.
+- Login state is exposed in /status as starting, loading_session, authenticating, waiting_code, verifying, ready, error or cancelled.
+- Added Instagram(challenge_callback=instagram_challenge_callback).
+- Added a RAM-only verification-code bridge with /auth/code and /auth/cancel.
+- Verification codes are never written to Drive or GitHub.
+- The control panel shows the code field when the Login challenge is waiting.
+- Removed the page-load refreshStatus() call; status refresh is manual only.
+- Added /favicon.ico returning HTTP 204.
+- Login first tries instaharvest_session.json from Google Drive and reuses the resulting active client for later scrapes/searches.
+- A successful password + verification login saves the session to the same Drive file.
+- A 429 while validating a saved session does not fall through immediately into another password login.
+- Scrape/search endpoints reject requests while Login is in its authentication or verification state.
+
+### Upstream API verification
+- PyPI documentation for instaharvest-v2 1.1.88 explicitly documents login(username, password), auth.save_session(), auth.load_session(), and challenge_callback for email/SMS challenges.
+- The same documentation confirms anonymous Instagram.anonymous(unlimited=True), Stories, Followers, Following, Highlights and download modules.
+- Source checked: PyPI instaharvest-v2 1.1.88 on 2026-10-06.
+
+### Validation status
+- GitHub source review completed after the patch.
+- Static marker checks confirm the challenge callback, background Login worker, persistent session load/save, /auth/code, /auth/cancel and removal of automatic status polling.
+- Actual Instagram authentication still requires the user's Colab runtime because the live account, network identity and Google Drive session are not accessible from this environment.
+
+### Important limitation
+- The revised control panel itself makes no background /status requests. If the exact new revision still produces repeated HTTP 200 lines after opening the page, those requests are originating from another client/tab/proxy layer or from an older server instance, not from the current page JavaScript.
