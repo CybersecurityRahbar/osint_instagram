@@ -10,9 +10,11 @@ NGROK_AUTH_TOKEN = " توكن انجروك"
 IG_USERNAME = "اسم المستخدم لحسابك"
 IG_PASSWORD = "كلمة المرور "
 
-# مسار المصادقة الافتراضي: محاكاة مسار login القديم داخل instagrapi 3.x.
+# مصادقة كلمة المرور المباشرة القديمة.
 # لا تستخدم Session ID المنسوخ من متصفح شخصي.
-LOGIN_STRATEGY = "legacy_first"
+# مهم: login_legacy() داخل instagrapi 3.x قد يحوّل بعض الأخطاء إلى CAA،
+# لذلك تستخدم الأداة هنا تدفق accounts/login مباشرة ولا تستدعي CAA تلقائياً.
+LOGIN_STRATEGY = "strict_legacy"
 PRIVATE_TRANSPORT_FOR_LOGIN = "requests"
 TELEGRAM_TOKEN = "توكن تيلجرام"
 TELEGRAM_CHAT_ID = "معرف تلجرام "
@@ -998,7 +1000,7 @@ class InstagramClient:
                 "session_retry_backoff_factor": 1,
                 "session_retry_statuses": [429, 500, 502, 503, 504],
             }
-            if legacy or LOGIN_STRATEGY == "legacy_first":
+            if legacy or LOGIN_STRATEGY in ("legacy_first", "strict_legacy"):
                 kwargs["private_transport"] = PRIVATE_TRANSPORT_FOR_LOGIN
             else:
                 kwargs["private_transport"] = "curl"
@@ -1028,6 +1030,89 @@ class InstagramClient:
 
 
     @classmethod
+    def _strict_legacy_password_login(cls, client):
+        """
+        Legacy password login مباشر، بدون CAA fallback.
+        يطابق بنية login القديمة في instagrapi:
+        pre_login_flow -> accounts/login/ -> authorization -> login_flow.
+        """
+        if not IG_USERNAME or not IG_PASSWORD:
+            raise RuntimeError("IG_USERNAME و IG_PASSWORD مطلوبان.")
+
+        client.username = str(IG_USERNAME).strip()
+        client.password = str(IG_PASSWORD)
+
+        # التطبيق القديم كان يتابع بعد 429 في pre_login_flow.
+        try:
+            client.pre_login_flow()
+        except Exception as pre_exc:
+            if cls._is_rate_limit_error(pre_exc):
+                print("⚠️ pre_login_flow أعاد 429 — سنكمل إلى accounts/login/ مثل التدفق القديم.")
+            else:
+                raise
+
+        enc_password = client.password_encrypt(client.password)
+        from instagrapi.utils.auth import generate_jazoest
+        data = {
+            "jazoest": generate_jazoest(client.phone_id),
+            "country_codes": '[{"country_code":"%d","source":["default"]}]' % int(client.country_code),
+            "phone_id": client.phone_id,
+            "enc_password": enc_password,
+            "username": client.username,
+            "adid": client.advertising_id,
+            "guid": client.uuid,
+            "device_id": client.android_device_id,
+            "google_tokens": "[]",
+            "login_attempt_count": "0",
+        }
+
+        try:
+            logged = client.private_request("accounts/login/", data, login=True)
+            client.authorization_data = client.parse_authorization(
+                client.last_response.headers.get("ig-set-authorization")
+            )
+        except TwoFactorRequired as exc:
+            # مسار 2FA القديم — لا نحول المصادقة إلى CAA.
+            from getpass import getpass
+            code = getpass("🔐 أدخل رمز Instagram (2FA/backup code): ").strip()
+            if not code:
+                raise exc
+
+            login_json = client.last_json if isinstance(client.last_json, dict) else {}
+            two_factor_identifier = login_json.get("two_factor_info", {}).get("two_factor_identifier")
+            if not two_factor_identifier:
+                raise RuntimeError(
+                    "Instagram طلب 2FA لكن لم يُرجع two_factor_identifier في استجابة accounts/login."
+                )
+
+            two_factor_data = {
+                "verification_code": code,
+                "phone_id": client.phone_id,
+                "_csrftoken": client.token,
+                "two_factor_identifier": two_factor_identifier,
+                "username": client.username,
+                "trust_this_device": "0",
+                "guid": client.uuid,
+                "device_id": client.android_device_id,
+                "waterfall_id": str(__import__("uuid").uuid4()),
+                "verification_method": "3",
+            }
+            logged = client.private_request(
+                "accounts/two_factor_login/", two_factor_data, login=True
+            )
+            client.authorization_data = client.parse_authorization(
+                client.last_response.headers.get("ig-set-authorization")
+            )
+
+        if not logged:
+            raise RuntimeError("Instagram رفض accounts/login ولم يُنشئ جلسة.")
+
+        client.login_flow()
+        client.last_login = time.time()
+        client.relogin_attempt = 0
+        return True
+
+    @classmethod
     def get_client(cls):
         if cls._client is not None:
             return cls._client
@@ -1042,7 +1127,7 @@ class InstagramClient:
                 session_elapsed = time.time() - cls._last_sessionid_failure_at if cls._last_sessionid_failure_at else float("inf")
                 if runtime_sessionid and session_elapsed >= cls._SESSIONID_COOLDOWN_SECONDS:
                     try:
-                        session_client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY == "legacy_first"))
+                        session_client = cls._configure_client(Client(), legacy=(LOGIN_STRATEGY in ("legacy_first", "strict_legacy")))
                         if cls._activate_sessionid(session_client, runtime_sessionid, "Session ID أثناء cooldown"):
                             return cls._client
                     except Exception:
@@ -1099,18 +1184,12 @@ class InstagramClient:
         # 3) لا نصل إلى login() إلا عندما لا توجد جلسة قابلة للاستخدام
         #    أو تحتاج الجلسة إلى إعادة مصادقة.
         try:
-            cls._configure_client(client, legacy=(LOGIN_STRATEGY == "legacy_first"))
-            if LOGIN_STRATEGY == "legacy_first" and hasattr(client, "login_legacy"):
-                try:
-                    ok = client.login_legacy(IG_USERNAME, IG_PASSWORD)
-                except TwoFactorRequired:
-                    from getpass import getpass
-                    code = getpass("🔐 Instagram verification code (2FA/backup code): ").strip()
-                    if not code:
-                        raise
-                    ok = client.login_legacy(
-                        IG_USERNAME, IG_PASSWORD, verification_code=code
-                    )
+            cls._configure_client(client, legacy=True)
+            if LOGIN_STRATEGY == "strict_legacy":
+                print("🔐 Legacy direct: accounts/login/ فقط — بدون CAA fallback")
+                ok = cls._strict_legacy_password_login(client)
+            elif LOGIN_STRATEGY == "legacy_first" and hasattr(client, "login_legacy"):
+                ok = client.login_legacy(IG_USERNAME, IG_PASSWORD)
             else:
                 ok = client.login(IG_USERNAME, IG_PASSWORD)
             if ok is False:
@@ -1132,9 +1211,9 @@ class InstagramClient:
 
             if status == 429 or "429" in message:
                 cls._mark_throttle(e)
-                print("🛑 Instagram أعاد 429 من CAA أثناء تسجيل الدخول.")
-                print("   لن نكرر password/CAA ولن نطلب Session ID من المتصفح.")
-                print("   هذه حالة تقييد مؤقت وليست فشلاً في كلمة المرور بالضرورة.")
+                print("🛑 Instagram أعاد 429 أثناء تدفق Legacy المباشر.")
+                print("   لم نصل إلى CAA ولم نكرر تسجيل الدخول تلقائياً.")
+                print("   إذا ظهر هنا 429، فهو من مرحلة pre_login أو accounts/login نفسها.")
             elif "challenge_required" in message.lower() or "manual verification" in message.lower():
                 cls._mark_challenge(e)
                 print("🛑 Instagram طلب تحقق أمني يدوي.")
@@ -1197,7 +1276,15 @@ class InstagramClient:
 
             if "login_required" in lower:
                 try:
-                    if LOGIN_STRATEGY == "legacy_first" and hasattr(cls._client, "login_legacy"):
+                    if LOGIN_STRATEGY == "strict_legacy":
+                        cls._client._clear_session_state(
+                            clear_authorization_data=True,
+                            clear_authorization_header=True,
+                            clear_private_cookies=True,
+                            clear_public_cookies=True,
+                        )
+                        ok = cls._strict_legacy_password_login(cls._client)
+                    elif LOGIN_STRATEGY == "legacy_first" and hasattr(cls._client, "login_legacy"):
                         ok = cls._client.login_legacy(IG_USERNAME, IG_PASSWORD, relogin=True)
                     else:
                         ok = cls._client.login(IG_USERNAME, IG_PASSWORD, relogin=True)
