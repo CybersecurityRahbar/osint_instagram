@@ -498,3 +498,41 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Real passwords/tokens are intentionally not committed to the public GitHub repository. They remain runtime/Colab variables. The old exposed credentials must be rotated because Git history may still contain them.
 - The ngrok startup path now explicitly requests `https://yin-spender-percent.ngrok-free.dev` and does not fall back to a random URL. If the domain is not available to the authenticated ngrok account, startup fails loudly instead of producing a different address.
 - Current ngrok documentation describes account development domains and fixed/custom endpoint URLs; exact availability of this specific domain can only be confirmed from the user's ngrok account at runtime.
+
+## 2026-10-06 — Runtime proof: verification callback was not reaching Login
+
+### User runtime evidence
+- The control panel loaded successfully with HTTP 200.
+- Anonymous scraping worked and public.get_posts returned 12 posts.
+- After selecting Login, Instagram sent an email/phone verification request.
+- No verification-code field became active.
+- Colab traceback ended with: CheckpointRequired: Email verification needed.
+- The library message suggested email_credentials, but that is an automatic mailbox-credential route and is not the desired manual code-entry workflow.
+
+### Root cause confirmed from instaharvest-v2 source
+- Instagram.__init__ accepts a challenge_callback and constructs a ChallengeHandler with it.
+- AuthAPI.login() receives challenge_callback as an explicit argument and passes it into the checkpoint resolver.
+- The project supplied the callback to Instagram(...) but did not pass it explicitly to ig.login(...).
+- In the observed Login path, the callback therefore did not reach the auth-platform resolver and it raised CheckpointRequired instead of waiting for the user's code.
+- PyPI documentation shows the library's challenge_callback concept for Email/SMS verification; source inspection explains why explicit propagation from the login call is needed in this runtime path.
+
+### Fix committed
+- ig.login() now receives challenge_callback=instagram_challenge_callback explicitly.
+- The verification panel remains visible through the Login lifecycle and enables the code input when status reaches waiting_code.
+- The RAM-only /auth/code and /auth/cancel endpoints remain in place.
+- Automatic status polling remains disabled.
+
+### Expected next runtime sequence
+1. Select Login.
+2. Click Apply.
+3. Instagram sends the verification code.
+4. Click the manual status refresh in the control panel.
+5. The state should become waiting_code and the code box should be enabled.
+6. Paste the received code and press Send Code.
+7. The Login worker completes and saves the authenticated session to Google Drive.
+
+### Validation
+- Static source check confirms one explicit login call with challenge_callback=instagram_challenge_callback.
+- Static source check confirms the code and cancel routes still exist.
+- Static source check confirms no automatic setInterval, setTimeout, or page-load status refresh remains.
+- Live Instagram verification still requires the user's Colab runtime.
