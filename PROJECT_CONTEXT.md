@@ -415,4 +415,26 @@ Do not delete the existing Drive session before testing. First restart/clean the
 ### ملاحظة الاختبار
 - الاختبار الواقعي النهائي يجب أن يكون في Colab نفسه، لأن قبول Instagram لعملية Login والجلسة لا يمكن محاكاته محلياً.
 - لا ينبغي إعادة استخدام Session ID من المتصفح بعد حادثة تسجيل الخروج/التحقق السابقة.
-- `instaharvest-v2` يعلن رسمياً في وثائقه عن دعم login/save_session/load_session وStories/Highlights وFollowers وDownload، وهو سبب اعتماد هذه الواجهة على تلك المسارات. 
+- `instaharvest-v2` يعلن رسمياً في وثائقه عن دعم login/save_session/load_session وStories/Highlights وFollowers وDownload، وهو سبب اعتماد هذه الواجهة على تلك المسارات.
+
+## 2026-10-06 — تصحيح توسعة osintinstagram2.py بعد فشل Anonymous
+
+### ملاحظة المستخدم
+- بعد التوسعة الأولى، Anonymous كان يعرض صورة البروفايل ومعلومات الحساب فقط، بينما لم تظهر المنشورات/بقية البيانات.
+- المستخدم لم يختبر Login Mode بعد.
+
+### السبب الهندسي
+- التوسعة الأولى وسّعت دورة `scrape` وعميل Instagram أكثر مما يلزم بدلاً من إبقاء مسار Anonymous الذي تم اختباره ميدانياً كما هو.
+- أضيفت مراحل مثل Reels وLogin-aware downloader وإدارة العميل قبل طبقة المنشورات، وبعض الاستثناءات كانت تتحول إلى قائمة فارغة، مما جعل الفشل غير واضح.
+- لذلك كان القرار الصحيح هو عزل المسار الأساسي للمنشورات عن الميزات الإضافية.
+
+### التصحيح
+- أعيدت Anonymous user resolution إلى `public.get_profile`.
+- أعيد مسار المنشورات الأساسي إلى `public.get_posts(username, max_count=...)` مباشرة.
+- أضيفت رسائل تشخيص صريحة:
+  - عدد المنشورات التي أعادها `public.get_posts`.
+  - عدد المنشورات التي ستتم معالجتها.
+  - الكود الحالي لكل منشور أثناء المعالجة.
+- أعيد تنزيل Anonymous إلى المسار المباشر من `video_url/display_url/thumbnail_url` الذي كان مستخدماً في النسخة الأصلية.
+- Reels وStories وHighlights وFollowers وFollowing أصبحت طبقات مستقلة ولا تمنع معالجة المنشورات الأساسية.
+- لم يتم حذف أي ميزة Login التي سبق إضافتها؛ Login session switching ما زال موجوداً.
