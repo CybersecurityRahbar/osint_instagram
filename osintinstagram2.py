@@ -243,23 +243,36 @@ def cancel_login():
     return True, "تم إلغاء Login."
 
 
-def instagram_challenge_callback(ctx):
-    """Bridge instaharvest-v2's email/SMS challenge into the web panel."""
+def instagram_challenge_callback(ctx=None):
+    """
+    Bridge instaharvest-v2 Email/SMS verification into the web panel.
+
+    1.1.88 has two callback shapes:
+      - ChallengeHandler calls callback(context)
+      - auth_platform.resolve_auth_platform calls callback() with no argument
+    Supporting both is required for the auth_platform path observed in Colab.
+    """
     global AUTH_CODE_VALUE
-    contact = extract(
-        ctx, "contact_point", "contact", "masked_contact",
-        default="وسيلة التحقق المسجلة"
-    )
+
+    if ctx is None:
+        contact = "البريد/الهاتف المرتبط بحساب Instagram"
+    else:
+        contact = extract(
+            ctx, "contact_point", "contact", "masked_contact",
+            default="وسيلة التحقق المسجلة"
+        )
+
     with AUTH_STATE_LOCK:
         AUTH_CODE_VALUE = None
         AUTH_CODE_EVENT.clear()
+
     set_auth_state(
         "waiting_code",
-        f"Instagram طلب رمز تحقق. أدخله من الهاتف/البريد ثم اضغط «إرسال الرمز».",
+        "Instagram أرسل رمز تحقق. انسخه هنا ثم اضغط «إرسال الرمز».",
         target_mode="login",
         contact_point=contact,
     )
-    print("🔢 Instagram طلب رمز تحقق؛ انتظر ظهور طلب الرمز ثم أدخله من الواجهة.")
+    print("🔢 Instagram طلب رمز تحقق؛ Login الآن ينتظر الرمز من لوحة التحكم.")
     if not AUTH_CODE_EVENT.wait(AUTH_CODE_TIMEOUT_SECONDS):
         set_auth_state(
             "error",
@@ -3310,8 +3323,8 @@ button:disabled{opacity:.55;cursor:not-allowed}
 <div id="authMessage" class="small" style="margin-bottom:8px"></div>
 <div class="row">
 <input type="text" id="verificationCode" inputmode="numeric" autocomplete="one-time-code"
-       placeholder="أدخل رمز البريد/الهاتف">
-<button id="submitCode" class="secondary">إرسال الرمز</button>
+       placeholder="أدخل رمز البريد/الهاتف" disabled>
+<button id="submitCode" class="secondary" disabled>إرسال الرمز</button>
 </div>
 <div class="row" style="margin-top:7px">
 <button id="cancelLogin" class="gray" type="button">إلغاء Login</button>
@@ -3443,7 +3456,8 @@ function renderStatus(data){
         (auth.contact_point ? ' · جهة التحقق: '+auth.contact_point : '');
     } else if(loginInProgress){
       authMessage.textContent =
-        (auth.message||'⏳ Login قيد التنفيذ. اضغط «تحديث الحالة» لمعرفة متى أصبح الرمز مطلوبًا.');
+        (auth.message||'⏳ Login قيد التنفيذ.') +
+        ' · عندما يصل الرمز اضغط «تحديث الحالة» مرة واحدة، ثم ستصبح خانة الرمز قابلة للكتابة.';
     } else {
       authMessage.textContent=auth.message||'';
     }
@@ -3451,7 +3465,15 @@ function renderStatus(data){
   const submit=document.getElementById('submitCode');
   const codeInput=document.getElementById('verificationCode');
   if(submit) submit.disabled=!waiting;
-  if(codeInput) codeInput.disabled=!waiting;
+  if(codeInput){
+    codeInput.disabled=!waiting;
+    codeInput.setAttribute('aria-disabled',String(!waiting));
+  }
+  if(waiting && codeInput){
+    try{
+      codeInput.focus();
+    }catch(e){}
+  }
 }
 
 function controlToken(){
