@@ -1,35 +1,68 @@
 # ============================================================
-# 🕵️ Instagram OSINT Scraper ULTRA v3.1 — instaharvest-v2 powered (FIXED)
-# ✅ تصحيح: استخدام public API بدلاً من users API في الوضع المجهول
-# ✅ Powered by instaharvest-v2 (async, anti-detection, 14-layer fallback)
+# 🕵️ Instagram OSINT Scraper ULTRA v4.0
+# instaharvest-v2 1.1.88
+#
+# Architecture:
+#   Anonymous core  -> public.get_profile / public.get_posts
+#   Login adapter   -> saved session + private modules for
+#                       Stories / Followers / Following / richer data
+#
+# Important:
+#   - Keep secrets out of GitHub. Set them in Colab environment vars.
+#   - This tool does not bypass Instagram security challenges/limits.
+#   - Anonymous mode intentionally stays on the proven public API path.
 # ============================================================
 
 # ============================================================
-# 1. الإعدادات
+# 1. Runtime configuration
 # ============================================================
-NGROK_AUTH_TOKEN = "3D7jdtzHrAWcvB3wrvii9O9XQWK_5xxaxx8csciSnyQWnNz2b"
-IG_USERNAME = "cybe_rphantom400"
-IG_PASSWORD = "phantom711#$opn"
+import os
 
-# instaharvest-v2: الوضع المجهول يعمل للبيانات العامة عبر ig.public.*
-USE_ANONYMOUS_MODE = True
-CURRENT_MODE = "anonymous"
-AUTH_SESSION_FILE = None
+NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN", "")
+IG_USERNAME = os.getenv("IG_USERNAME", "")
+IG_PASSWORD = os.getenv("IG_PASSWORD", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_TOKEN = "8244019772:AAHT7uLh1yHEKlKJsDUps4SNPRpkjSG_msw"
-TELEGRAM_CHAT_ID = "8266435771"
+START_MODE = "anonymous"
+REQUIRED_INSTAHARVEST_VERSION = "1.1.88"
 
 MAX_TRAVERSE_LIMIT = 10000
 THUMB_MAX_SIZE = 150
 THUMB_QUALITY = 40
 THUMB_OPTIMIZE = True
 
-# ============================================================
-# 2. الاستيرادات
-# ============================================================
-REQUIRED_INSTAHARVEST_VERSION = "1.1.88"
+# Colab-safe paths
+try:
+    from google.colab import drive
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+    drive = None
 
+# ============================================================
+# 2. Imports / dependency check
+# ============================================================
 import importlib.metadata as importlib_metadata
+import base64
+import csv
+import io
+import json
+import random
+import re
+import shutil
+import socket
+import sqlite3
+import threading
+import time
+import traceback
+from datetime import datetime
+from html import escape as html_escape
+from pathlib import Path
+
+import requests
+from flask import Flask, jsonify, render_template_string, request
+from pyngrok import ngrok
 
 try:
     INSTAHARVEST_VERSION = importlib_metadata.version("instaharvest-v2")
@@ -40,15 +73,9 @@ if INSTAHARVEST_VERSION != REQUIRED_INSTAHARVEST_VERSION:
     raise RuntimeError(
         "نسخة instaharvest-v2 غير صحيحة. "
         f"المطلوب: {REQUIRED_INSTAHARVEST_VERSION} | "
-        f"المثبت حالياً: {INSTAHARVEST_VERSION or 'غير مثبت'}. "
-        "ثبّت النسخة المطلوبة: pip install instaharvest-v2==1.1.88"
+        f"المثبت: {INSTAHARVEST_VERSION or 'غير مثبت'}. "
+        "ثبت النسخة المطلوبة في خلية dependencies."
     )
-
-import os, shutil, json, io, time, random, requests, threading, sqlite3, traceback, csv, re, base64
-from datetime import datetime
-from html import escape as html_escape
-from flask import Flask, request, render_template_string, jsonify
-from pyngrok import ngrok
 
 from instaharvest_v2 import Instagram
 
@@ -57,147 +84,236 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
-    print("⚠️ PIL غير متوفر")
-
-try:
-    from google.colab import drive
-    IN_COLAB = True
-except ImportError:
-    IN_COLAB = False
-    drive = None
-
-_http_session = requests.Session()
-_http_session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-})
+    print("⚠️ PIL غير متوفر؛ التقارير ستستخدم placeholders للصورة.")
 
 # ============================================================
-# 3. التليجرام (مع retry)
+# 3. Shared HTTP / locks / runtime state
+# ============================================================
+_http_session = requests.Session()
+_http_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/142.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+INSTAGRAM_JOB_LOCK = threading.Lock()
+CLIENT_SWITCH_LOCK = threading.RLock()
+JOB_STATE_LOCK = threading.Lock()
+
+JOB_STATE = {
+    "state": "idle",
+    "username": "",
+    "kind": "",
+    "started_at": None,
+    "finished_at": None,
+    "message": "جاهز",
+}
+
+# ============================================================
+# 4. Utility helpers
+# ============================================================
+def safe_int(value, default=0, minimum=None, maximum=None):
+    try:
+        v = int(str(value).strip() or default)
+    except (ValueError, TypeError):
+        v = default
+    if minimum is not None:
+        v = max(v, minimum)
+    if maximum is not None:
+        v = min(v, maximum)
+    return v
+
+
+def safe_name(value, fallback="item"):
+    value = str(value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9_.@-]+", "_", value)
+    return value[:120] or fallback
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def set_job_state(state, username="", kind="", message=""):
+    with JOB_STATE_LOCK:
+        JOB_STATE.update({
+            "state": state,
+            "username": username,
+            "kind": kind,
+            "message": message,
+            "started_at": JOB_STATE.get("started_at") if state not in ("running", "starting") else now_iso(),
+            "finished_at": now_iso() if state in ("done", "error", "idle") else None,
+        })
+
+
+def get_job_state():
+    with JOB_STATE_LOCK:
+        return dict(JOB_STATE)
+
+
+def redact_error(exc):
+    value = str(exc).strip() or type(exc).__name__
+    # Never echo credentials into browser/Telegram messages.
+    for secret in (IG_PASSWORD, IG_USERNAME, TELEGRAM_TOKEN, NGROK_AUTH_TOKEN):
+        if secret:
+            value = value.replace(secret, "***")
+    return value[:800]
+
+
+def extract(obj, *keys, default=""):
+    for key in keys:
+        try:
+            value = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+        except Exception:
+            value = None
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    try:
+        return list(value)
+    except Exception:
+        return [value]
+
+
+def dedupe_items(items):
+    seen = set()
+    out = []
+    for item in items or []:
+        key = extract(item, "pk", "id", "code", "shortcode", default="")
+        key = str(key or "")
+        if not key:
+            key = repr(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def parse_shortcode_from_url(url):
+    m = re.search(
+        r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)",
+        str(url or ""),
+        flags=re.I,
+    )
+    return m.group(1) if m else ""
+
+
+def is_rate_limit_error(exc):
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+# ============================================================
+# 5. Telegram
 # ============================================================
 class TelegramSender:
     @staticmethod
+    def _enabled():
+        return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
+    @staticmethod
+    def _post(endpoint, data=None, files=None, timeout=20):
+        if not TelegramSender._enabled():
+            print("ℹ️ Telegram غير مهيأ؛ تخطي الإرسال.")
+            return None
+        try:
+            return _http_session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{endpoint}",
+                data=data or {},
+                files=files,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            print(f"⚠️ Telegram {endpoint}: {redact_error(exc)}")
+            return None
+
+    @staticmethod
     def send_message(text, retries=2):
-        for i in range(retries + 1):
-            try:
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": text[:4096],
-                        "parse_mode": "Markdown",
-                        "disable_web_page_preview": "true",
-                    },
-                    timeout=15)
-                if r.status_code == 200:
-                    return True
-                if i < retries:
-                    time.sleep(2)
-            except Exception as e:
-                if i < retries:
-                    time.sleep(2)
-                else:
-                    print(f"⚠️ تليجرام: {e}")
+        if not TelegramSender._enabled():
+            return False
+        for attempt in range(retries + 1):
+            r = TelegramSender._post(
+                "sendMessage",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": str(text)[:4096],
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=20,
+            )
+            if r is not None and r.status_code == 200:
+                return True
+            if attempt < retries:
+                time.sleep(1.5)
+        if r is not None:
+            print(f"⚠️ Telegram sendMessage: HTTP {r.status_code} {r.text[:250]}")
         return False
 
     @staticmethod
-    def send_rich_message(html_text, reply_markup=None, retries=2):
+    def send_message_html(html_text, retries=2):
+        if not TelegramSender._enabled():
+            return False
+        for attempt in range(retries + 1):
+            r = TelegramSender._post(
+                "sendMessage",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": str(html_text)[:4096],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=20,
+            )
+            if r is not None and r.status_code == 200:
+                return True
+            if attempt < retries:
+                time.sleep(1.5)
+        if r is not None:
+            print(f"⚠️ Telegram HTML: HTTP {r.status_code} {r.text[:250]}")
+        return False
+
+    @staticmethod
+    def send_rich_message(html_text, reply_markup=None):
+        # RichMessage is not available in every Bot API gateway.
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "rich_message": json.dumps({
-                "html": html_text[:32768],
-                "is_rtl": True
+                "html": str(html_text)[:32768],
+                "is_rtl": True,
             }, ensure_ascii=False),
             "disable_notification": False,
         }
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
 
-        for i in range(retries + 1):
-            try:
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendRichMessage",
-                    data=payload, timeout=20)
-                if r.status_code == 200:
-                    return True
-                if i < retries:
-                    time.sleep(1.5)
-            except Exception as e:
-                if i < retries:
-                    time.sleep(1.5)
-                else:
-                    print(f"⚠️ Rich Message: {e}")
+        r = TelegramSender._post("sendRichMessage", data=payload, timeout=25)
+        if r is not None and r.status_code == 200:
+            return True
 
-        try:
-            r = _http_session.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": TelegramSender._strip_rich_html(html_text)[:4096],
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "false",
-                },
-                timeout=15)
-            return r.status_code == 200
-        except Exception as e:
-            print(f"⚠️ Rich fallback: {e}")
-            return False
+        # Fallback to HTML sendMessage.
+        return TelegramSender.send_message_html(html_text)
 
     @staticmethod
-    def _strip_rich_html(html_text):
-        text_value = re.sub(r"<blockquote[^>]*>", "", html_text, flags=re.I)
-        text_value = re.sub(r"</blockquote>", "", text_value, flags=re.I)
-        text_value = re.sub(r"<details[^>]*>", "", text_value, flags=re.I)
-        text_value = re.sub(r"</details>", "", text_value, flags=re.I)
-        text_value = re.sub(r"<[^>]+>", "", text_value)
-        return text_value.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", '"')
-
-    @staticmethod
-    def send_follower_list(username, followers):
-        followers = list(followers or [])
-        total = len(followers)
-        if total == 0:
-            return False
-
-        chunk_size = 20
-        for start_idx in range(0, total, chunk_size):
-            chunk = followers[start_idx:start_idx + chunk_size]
-            lines = []
-            for absolute_idx, follower in enumerate(chunk, start_idx + 1):
-                uname = html_escape(str(getattr(follower, "username", "") or ""))
-                fullname = html_escape(str(getattr(follower, "full_name", "") or "—"))
-                lines.append(f"<b>{absolute_idx:03d}.</b> @{uname} — {fullname}")
-            html_text = (
-                f"<b>👥 المتابعون — @{html_escape(username.lstrip('@'))}</b>\n"
-                f"📦 {start_idx + 1}–{start_idx + len(chunk)} من {total}\n\n"
-                + "\n".join(lines)
-            )
-            TelegramSender.send_message_html(html_text)
-            time.sleep(0.7)
-        return True
-
-    @staticmethod
-    def send_message_html(html_text, retries=2):
-        for i in range(retries + 1):
-            try:
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": html_text[:4096],
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": "true",
-                    },
-                    timeout=15)
-                if r.status_code == 200:
-                    return True
-            except Exception as e:
-                if i < retries:
-                    time.sleep(1.5)
-                else:
-                    print(f"⚠️ Telegram HTML: {e}")
-            if i < retries:
-                time.sleep(1.5)
-        return False
+    def _strip_html(value):
+        value = re.sub(r"<[^>]+>", "", str(value or ""))
+        return (
+            value.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace("&quot;", '"')
+        )
 
     @staticmethod
     def _post_keyboard(url, profile_url=None):
@@ -207,83 +323,121 @@ class TelegramSender:
         return {"inline_keyboard": rows}
 
     @staticmethod
-    def send_photo(photo_path, caption="", reply_markup=None):
+    def send_photo(path, caption="", reply_markup=None):
+        if not TelegramSender._enabled() or not path or not os.path.exists(path):
+            return False
         try:
-            with open(photo_path, "rb") as f:
-                payload = {
+            with open(path, "rb") as fh:
+                data = {
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption[:1024],
+                    "caption": str(caption)[:1024],
                     "parse_mode": "HTML",
                     "show_caption_above_media": "true",
                 }
                 if reply_markup:
-                    payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                    data=payload, files={"photo": f}, timeout=30)
-                if r.status_code == 200:
-                    return True
+                    data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+                r = TelegramSender._post(
+                    "sendPhoto", data=data, files={"photo": fh}, timeout=60
+                )
+            if r is not None and r.status_code == 200:
+                return True
+            if r is not None:
+                print(f"⚠️ Telegram photo: HTTP {r.status_code} {r.text[:250]}")
 
-                payload["caption"] = TelegramSender._strip_rich_html(caption)[:1024]
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                    data=payload, files={"photo": f}, timeout=30)
-                return r.status_code == 200
-        except Exception as e:
-            print(f"⚠️ صورة: {e}")
+            # Caption fallback.
+            with open(path, "rb") as fh:
+                data["caption"] = TelegramSender._strip_html(caption)[:1024]
+                r = TelegramSender._post(
+                    "sendPhoto", data=data, files={"photo": fh}, timeout=60
+                )
+            return r is not None and r.status_code == 200
+        except Exception as exc:
+            print(f"⚠️ صورة: {redact_error(exc)}")
             return False
 
     @staticmethod
-    def send_video(video_path, caption="", reply_markup=None):
+    def send_video(path, caption="", reply_markup=None):
+        if not TelegramSender._enabled() or not path or not os.path.exists(path):
+            return False
         try:
-            with open(video_path, "rb") as f:
-                payload = {
+            with open(path, "rb") as fh:
+                data = {
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption[:1024],
+                    "caption": str(caption)[:1024],
                     "parse_mode": "HTML",
                     "show_caption_above_media": "true",
                     "supports_streaming": "true",
                 }
                 if reply_markup:
-                    payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo",
-                    data=payload, files={"video": f}, timeout=90)
-                if r.status_code == 200:
-                    return True
+                    data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+                r = TelegramSender._post(
+                    "sendVideo", data=data, files={"video": fh}, timeout=120
+                )
+            if r is not None and r.status_code == 200:
+                return True
+            if r is not None:
+                print(f"⚠️ Telegram video: HTTP {r.status_code} {r.text[:250]}")
 
-                payload["caption"] = TelegramSender._strip_rich_html(caption)[:1024]
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo",
-                    data=payload, files={"video": f}, timeout=90)
-                return r.status_code == 200
-        except Exception as e:
-            print(f"⚠️ فيديو: {e}")
+            with open(path, "rb") as fh:
+                data["caption"] = TelegramSender._strip_html(caption)[:1024]
+                r = TelegramSender._post(
+                    "sendVideo", data=data, files={"video": fh}, timeout=120
+                )
+            return r is not None and r.status_code == 200
+        except Exception as exc:
+            print(f"⚠️ فيديو: {redact_error(exc)}")
             return False
 
     @staticmethod
-    def send_document(file_path, caption=""):
+    def send_document(path, caption=""):
+        if not TelegramSender._enabled() or not path or not os.path.exists(path):
+            return False
         try:
-            with open(file_path, "rb") as f:
-                r = _http_session.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+            with open(path, "rb") as fh:
+                r = TelegramSender._post(
+                    "sendDocument",
                     data={
                         "chat_id": TELEGRAM_CHAT_ID,
-                        "caption": caption[:1024],
+                        "caption": str(caption)[:1024],
                         "parse_mode": "HTML",
                     },
-                    files={"document": f}, timeout=60)
-                return r.status_code == 200
-        except Exception as e:
-            print(f"⚠️ ملف: {e}")
+                    files={"document": fh},
+                    timeout=120,
+                )
+            return r is not None and r.status_code == 200
+        except Exception as exc:
+            print(f"⚠️ ملف: {redact_error(exc)}")
             return False
 
+    @staticmethod
+    def send_follower_list(username, followers, title="👥 المتابعون"):
+        followers = list(followers or [])
+        if not followers:
+            return False
+        total = len(followers)
+        for start in range(0, total, 20):
+            chunk = followers[start:start + 20]
+            lines = []
+            for idx, user in enumerate(chunk, start + 1):
+                uname = html_escape(str(extract(user, "username", default="") or ""))
+                fullname = html_escape(str(extract(user, "full_name", "fullname", default="—") or "—"))
+                lines.append(f"<b>{idx:03d}.</b> @{uname} — {fullname}")
+            msg = (
+                f"<b>{title} — @{html_escape(username)}</b>\n"
+                f"📦 {start + 1}–{start + len(chunk)} من {total}\n\n"
+                + "\n".join(lines)
+            )
+            TelegramSender.send_message_html(msg)
+            time.sleep(0.5)
+        return True
+
+
 # ============================================================
-# 4. المسارات
+# 6. Paths
 # ============================================================
 if IN_COLAB:
     if not os.path.exists("/content/drive/MyDrive"):
-        drive.mount('/content/drive')
+        drive.mount("/content/drive")
     BASE_PATH = "/content/drive/MyDrive/Instagram_Scraper_DB"
 else:
     BASE_PATH = os.path.join(os.getcwd(), "Instagram_Scraper_DB")
@@ -293,219 +447,354 @@ MEDIA_PATH = os.path.join(BASE_PATH, "media")
 REPORTS_PATH = os.path.join(BASE_PATH, "reports")
 STORIES_PATH = os.path.join(BASE_PATH, "stories")
 HIGHLIGHTS_PATH = os.path.join(BASE_PATH, "highlights")
+DB_BACKUP_PATH = os.path.join(BASE_PATH, "db_backups")
 
-for p in (BASE_PATH, MEDIA_PATH, REPORTS_PATH, STORIES_PATH, HIGHLIGHTS_PATH):
-    os.makedirs(p, exist_ok=True)
+for folder in (BASE_PATH, MEDIA_PATH, REPORTS_PATH, STORIES_PATH, HIGHLIGHTS_PATH, DB_BACKUP_PATH):
+    os.makedirs(folder, exist_ok=True)
 
-print(f"📁 {BASE_PATH}")
+print(f"📁 قاعدة البيانات: {DB_PATH}")
+
 
 # ============================================================
-# 5. 🎨 نظام الصور المصغرة
+# 7. Thumbnails
 # ============================================================
 class ThumbnailEngine:
-    _url_cache = {}
-    _MAX_CACHE_SIZE = 500
+    _cache = {}
+    _max_cache = 500
 
     @classmethod
     def from_url(cls, url, max_size=THUMB_MAX_SIZE, quality=THUMB_QUALITY, cache_key=None):
         if not url or not PIL_AVAILABLE:
             return None
-        cache_key = cache_key or str(url)
-        if cache_key in cls._url_cache:
-            return cls._url_cache[cache_key]
+        key = cache_key or str(url)
+        if key in cls._cache:
+            return cls._cache[key]
         try:
-            r = _http_session.get(str(url), timeout=15, stream=True)
+            r = _http_session.get(str(url), timeout=20, stream=True)
             if r.status_code != 200:
                 return None
             img = Image.open(io.BytesIO(r.content))
             img.thumbnail((max_size, max_size), Image.LANCZOS)
-            if img.mode in ('RGBA', 'P', 'LA'):
-                img = img.convert('RGB')
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=quality, optimize=THUMB_OPTIMIZE,
-                    progressive=True)
-            b64 = base64.b64encode(buffer.getvalue()).decode()
-            if len(cls._url_cache) >= cls._MAX_CACHE_SIZE:
-                oldest = next(iter(cls._url_cache))
-                del cls._url_cache[oldest]
-            cls._url_cache[cache_key] = b64
-            return b64
-        except Exception as e:
-            print(f"      ⚠️ thumb_from_url: {e}")
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(
+                buf, format="JPEG", quality=quality,
+                optimize=THUMB_OPTIMIZE, progressive=True
+            )
+            encoded = base64.b64encode(buf.getvalue()).decode()
+            if len(cls._cache) >= cls._max_cache:
+                cls._cache.pop(next(iter(cls._cache)))
+            cls._cache[key] = encoded
+            return encoded
+        except Exception as exc:
+            print(f"⚠️ Thumbnail URL: {redact_error(exc)}")
             return None
 
     @staticmethod
-    def from_file(file_path, max_size=THUMB_MAX_SIZE, quality=THUMB_QUALITY):
-        if not file_path or not os.path.exists(file_path) or not PIL_AVAILABLE:
+    def from_file(path, max_size=THUMB_MAX_SIZE, quality=THUMB_QUALITY):
+        if not path or not os.path.exists(path) or not PIL_AVAILABLE:
             return None
-        thumb_path = file_path + ".thumb.jpg"
-        if os.path.exists(thumb_path):
-            try:
-                with open(thumb_path, "rb") as f:
-                    return base64.b64encode(f.read()).decode()
-            except: pass
+        if path.lower().endswith((".mp4", ".mov", ".webm")):
+            return None
+        thumb_path = path + ".thumb.jpg"
         try:
-            if file_path.lower().endswith(('.mp4', '.mov', '.webm')):
-                return None
-            img = Image.open(file_path)
+            if os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as fh:
+                    return base64.b64encode(fh.read()).decode()
+            img = Image.open(path)
             img.thumbnail((max_size, max_size), Image.LANCZOS)
-            if img.mode in ('RGBA', 'P', 'LA'):
-                img = img.convert('RGB')
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=quality, optimize=THUMB_OPTIMIZE,
-                    progressive=True)
-            b64 = base64.b64encode(buffer.getvalue()).decode()
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(
+                buf, format="JPEG", quality=quality,
+                optimize=THUMB_OPTIMIZE, progressive=True
+            )
+            raw = buf.getvalue()
             try:
-                with open(thumb_path, "wb") as f:
-                    f.write(buffer.getvalue())
-            except: pass
-            return b64
-        except Exception as e:
-            print(f"      ⚠️ thumb_from_file: {e}")
+                with open(thumb_path, "wb") as fh:
+                    fh.write(raw)
+            except Exception:
+                pass
+            return base64.b64encode(raw).decode()
+        except Exception as exc:
+            print(f"⚠️ Thumbnail file: {redact_error(exc)}")
             return None
 
     @staticmethod
-    def placeholder_svg(icon='📷'):
-        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="150" height="150" viewBox="0 0 150 150">
-        <rect fill="#2a2a3e" width="150" height="150"/>
-        <text x="75" y="85" font-size="50" text-anchor="middle" fill="#e94560">{icon}</text>
-        </svg>'''
+    def placeholder_svg(icon="📷"):
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="150" height="150">'
+            '<rect fill="#2a2a3e" width="150" height="150"/>'
+            f'<text x="75" y="85" font-size="50" text-anchor="middle" fill="#e94560">{icon}</text>'
+            "</svg>"
+        )
         return base64.b64encode(svg.encode()).decode()
 
-# ============================================================
-# 6. قاعدة البيانات
-# ============================================================
-def _table_exists(cursor, table):
-    cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cursor.fetchone() is not None
 
-def _table_columns(cursor, table):
-    cursor.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cursor.fetchall()}
+# ============================================================
+# 8. SQLite — cumulative / non-destructive
+# ============================================================
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
-def _backup_db_before_migration():
+
+def table_exists(cur, table):
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+def table_columns(cur, table):
+    cur.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}
+
+
+def backup_database(reason="migration"):
     if not os.path.exists(DB_PATH):
         return None
     try:
-        backup_dir = os.path.join(BASE_PATH, "db_backups")
-        os.makedirs(backup_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(
-            backup_dir, f"instagram_scraper_before_schema_migration_{stamp}.sqlite"
+        dest = os.path.join(
+            DB_BACKUP_PATH,
+            f"instagram_data_before_{safe_name(reason)}_{stamp}.sqlite"
         )
-        shutil.copy2(DB_PATH, path)
-        print(f"🛡️ نسخة احتياطية لقاعدة البيانات: {path}")
-        return path
-    except Exception as e:
-        print(f"⚠️ النسخة الاحتياطية: {type(e).__name__}: {str(e)[:160]}")
+        src = db_connect()
+        dst = sqlite3.connect(dest)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        print(f"🛡️ DB backup: {dest}")
+        return dest
+    except Exception as exc:
+        print(f"⚠️ DB backup: {redact_error(exc)}")
         return None
 
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    conn = db_connect()
+    cur = conn.cursor()
 
-    if os.path.exists(DB_PATH):
-        needs_backup = False
-        if _table_exists(c, "accounts"):
-            cols = _table_columns(c, "accounts")
-            needs_backup = not {"is_business","category","external_url","profile_pic"}.issubset(cols)
-        else:
-            needs_backup = True
-        c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='following'")
-        if c.fetchone() is None:
-            needs_backup = True
-        if needs_backup:
-            conn.close()
-            _backup_db_before_migration()
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            full_name TEXT,
+            bio TEXT,
+            followers INTEGER,
+            following INTEGER,
+            posts_count INTEGER,
+            is_private BOOLEAN,
+            is_verified BOOLEAN,
+            last_scraped DATETIME
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE,
-        full_name TEXT, bio TEXT, followers INTEGER, following INTEGER,
-        posts_count INTEGER, is_private BOOLEAN, is_verified BOOLEAN,
-        last_scraped DATETIME)''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            post_code TEXT UNIQUE,
+            post_url TEXT,
+            media_type TEXT,
+            caption TEXT,
+            like_count INTEGER,
+            comment_count INTEGER,
+            view_count INTEGER DEFAULT 0,
+            play_count INTEGER DEFAULT 0,
+            taken_at DATETIME,
+            file_path TEXT,
+            downloaded BOOLEAN DEFAULT 0,
+            thumbnail_url TEXT,
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
-        post_code TEXT UNIQUE, post_url TEXT, media_type TEXT, caption TEXT,
-        like_count INTEGER, comment_count INTEGER, view_count INTEGER DEFAULT 0,
-        play_count INTEGER DEFAULT 0, taken_at DATETIME,
-        file_path TEXT, downloaded BOOLEAN DEFAULT 0,
-        thumbnail_url TEXT,
-        FOREIGN KEY(account_id) REFERENCES accounts(id))''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER,
+            comment_text TEXT,
+            commenter_username TEXT,
+            commenter_full_name TEXT,
+            created_at DATETIME,
+            FOREIGN KEY(post_id) REFERENCES posts(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS comments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER,
-        comment_text TEXT, commenter_username TEXT, commenter_full_name TEXT,
-        created_at DATETIME, FOREIGN KEY(post_id) REFERENCES posts(id))''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS followers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            username TEXT,
+            full_name TEXT,
+            first_seen DATETIME,
+            UNIQUE(account_id, username),
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS followers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
-        username TEXT, full_name TEXT, first_seen DATETIME,
-        UNIQUE(account_id, username),
-        FOREIGN KEY(account_id) REFERENCES accounts(id))''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS following (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            username TEXT,
+            full_name TEXT,
+            first_seen DATETIME,
+            UNIQUE(account_id, username),
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS stories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
-        story_pk TEXT UNIQUE, media_type TEXT, taken_at DATETIME,
-        file_path TEXT, story_url TEXT, downloaded BOOLEAN DEFAULT 0,
-        thumbnail_url TEXT,
-        FOREIGN KEY(account_id) REFERENCES accounts(id))''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            story_pk TEXT UNIQUE,
+            media_type TEXT,
+            taken_at DATETIME,
+            file_path TEXT,
+            story_url TEXT,
+            downloaded BOOLEAN DEFAULT 0,
+            thumbnail_url TEXT,
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS highlights (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER,
-        highlight_pk TEXT UNIQUE, title TEXT, media_count INTEGER,
-        cover_url TEXT, cover_path TEXT, downloaded BOOLEAN DEFAULT 0,
-        FOREIGN KEY(account_id) REFERENCES accounts(id))''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS highlights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            highlight_pk TEXT UNIQUE,
+            title TEXT,
+            media_count INTEGER,
+            cover_url TEXT,
+            cover_path TEXT,
+            downloaded BOOLEAN DEFAULT 0,
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS highlight_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, highlight_id INTEGER,
-        item_pk TEXT UNIQUE, media_type TEXT, taken_at DATETIME,
-        file_path TEXT, video_url TEXT, downloaded BOOLEAN DEFAULT 0,
-        FOREIGN KEY(highlight_id) REFERENCES highlights(id))''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS highlight_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            highlight_id INTEGER,
+            item_pk TEXT UNIQUE,
+            media_type TEXT,
+            taken_at DATETIME,
+            file_path TEXT,
+            video_url TEXT,
+            downloaded BOOLEAN DEFAULT 0,
+            FOREIGN KEY(highlight_id) REFERENCES highlights(id)
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS search_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT, result_type TEXT,
-        username TEXT, full_name TEXT, pk TEXT, extra_data TEXT,
-        created_at DATETIME)''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS search_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query TEXT,
+            result_type TEXT,
+            username TEXT,
+            full_name TEXT,
+            pk TEXT,
+            extra_data TEXT,
+            created_at DATETIME
+        )
+    """)
 
-    c.execute('''CREATE TABLE IF NOT EXISTS mentions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT, source_type TEXT,
-        source_pk TEXT, source_url TEXT, context TEXT,
-        mentioned_username TEXT, mentioned_full_name TEXT,
-        created_at DATETIME)''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mentions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query TEXT,
+            source_type TEXT,
+            source_pk TEXT,
+            source_url TEXT,
+            context TEXT,
+            mentioned_username TEXT,
+            mentioned_full_name TEXT,
+            created_at DATETIME
+        )
+    """)
 
-    account_cols = _table_columns(c, "accounts")
-    for col, decl in {
-        "is_business": "INTEGER DEFAULT 0",
-        "category": "TEXT DEFAULT ''",
-        "external_url": "TEXT DEFAULT ''",
-        "profile_pic": "TEXT DEFAULT ''",
-    }.items():
-        if col not in account_cols:
-            c.execute(f"ALTER TABLE accounts ADD COLUMN {col} {decl}")
-            print(f"🔧 Migration: أضيف {col} لـ accounts")
+    changes = []
+    if table_exists(cur, "accounts"):
+        cols = table_columns(cur, "accounts")
+        for col, decl in {
+            "is_business": "INTEGER DEFAULT 0",
+            "category": "TEXT DEFAULT ''",
+            "external_url": "TEXT DEFAULT ''",
+            "profile_pic": "TEXT DEFAULT ''",
+        }.items():
+            if col not in cols:
+                changes.append(("accounts", col))
+    if table_exists(cur, "stories"):
+        cols = table_columns(cur, "stories")
+        if "story_url" not in cols:
+            changes.append(("stories", "story_url"))
+        if "thumbnail_url" not in cols:
+            changes.append(("stories", "thumbnail_url"))
 
-    c.execute('''CREATE TABLE IF NOT EXISTS following (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_id INTEGER,
-        username TEXT,
-        full_name TEXT,
-        first_seen DATETIME,
-        UNIQUE(account_id, username),
-        FOREIGN KEY(account_id) REFERENCES accounts(id)
-    )''')
+    if changes:
+        conn.commit()
+        conn.close()
+        backup_database("schema_migration")
+        conn = db_connect()
+        cur = conn.cursor()
+
+        cols = table_columns(cur, "accounts")
+        for col, decl in {
+            "is_business": "INTEGER DEFAULT 0",
+            "category": "TEXT DEFAULT ''",
+            "external_url": "TEXT DEFAULT ''",
+            "profile_pic": "TEXT DEFAULT ''",
+        }.items():
+            if col not in cols:
+                cur.execute(f"ALTER TABLE accounts ADD COLUMN {col} {decl}")
+
+        cols = table_columns(cur, "stories")
+        if "story_url" not in cols:
+            cur.execute("ALTER TABLE stories ADD COLUMN story_url TEXT DEFAULT ''")
+        if "thumbnail_url" not in cols:
+            cur.execute("ALTER TABLE stories ADD COLUMN thumbnail_url TEXT DEFAULT ''")
+
+    # Dedupe comments without rewriting the existing table.
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_dedupe
+        ON comments(post_id, commenter_username, created_at, comment_text)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_posts_account_taken
+        ON posts(account_id, taken_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_followers_account
+        ON followers(account_id)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_following_account
+        ON following(account_id)
+    """)
 
     conn.commit()
     conn.close()
-    print("✅ قاعدة البيانات جاهزة")
+    print("✅ قاعدة البيانات جاهزة — البيانات القديمة محفوظة.")
+
 
 def save_or_update_account(info):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute('''INSERT INTO accounts
-        (username, full_name, bio, followers, following, posts_count,
-         is_private, is_verified, last_scraped, is_business, category, external_url, profile_pic)
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO accounts (
+            username, full_name, bio, followers, following, posts_count,
+            is_private, is_verified, last_scraped,
+            is_business, category, external_url, profile_pic
+        )
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(username) DO UPDATE SET
             full_name=excluded.full_name,
@@ -519,317 +808,444 @@ def save_or_update_account(info):
             is_business=excluded.is_business,
             category=excluded.category,
             external_url=excluded.external_url,
-            profile_pic=excluded.profile_pic''',
-        (info['username'], info['full_name'], info['bio'], info['followers'],
-         info['following'], info['posts_count'], int(info['is_private']),
-         int(info['is_verified']), datetime.now().isoformat(),
-         int(info.get('is_business', False)), str(info.get('category', '')),
-         str(info.get('external_url', '')), str(info.get('profile_pic', ''))))
-    conn.commit(); conn.close()
+            profile_pic=excluded.profile_pic
+    """, (
+        str(info.get("username", "")),
+        str(info.get("full_name", "")),
+        str(info.get("bio", "")),
+        int(info.get("followers", 0) or 0),
+        int(info.get("following", 0) or 0),
+        int(info.get("posts_count", 0) or 0),
+        int(bool(info.get("is_private", False))),
+        int(bool(info.get("is_verified", False))),
+        now_iso(),
+        int(bool(info.get("is_business", False))),
+        str(info.get("category", "")),
+        str(info.get("external_url", "")),
+        str(info.get("profile_pic", "")),
+    ))
+    conn.commit()
+    conn.close()
 
-def _extract(obj, *keys, default=''):
-    """استخراج مرن من dict أو object"""
-    for k in keys:
-        if isinstance(obj, dict):
-            v = obj.get(k)
-        else:
-            v = getattr(obj, k, None)
-        if v not in (None, ''):
-            return v
-    return default
 
-def save_post_if_not_exists(account_username, media, media_type=None, file_path=None):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT id FROM accounts WHERE username=?", (account_username,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    account_id = row[0]
+def get_account_id(username):
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT id FROM accounts WHERE username=?",
+        (str(username).lower().lstrip("@"),),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
 
-    code = str(_extract(media, 'code', 'shortcode', default=''))
+
+def get_account_info(username):
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM accounts WHERE username=?",
+        (str(username).lower().lstrip("@"),),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_post_if_not_exists(account_username, media):
+    username = str(account_username).lower().lstrip("@")
+    code = str(extract(media, "code", "shortcode", default="") or "")
     if not code:
+        return None
+
+    conn = db_connect()
+    cur = conn.cursor()
+    account = cur.execute(
+        "SELECT id FROM accounts WHERE username=?",
+        (username,),
+    ).fetchone()
+    if not account:
         conn.close()
         return None
 
-    c.execute("SELECT id, file_path, downloaded FROM posts WHERE post_code=?", (code,))
-    existing = c.fetchone()
-    if existing:
-        post_id = existing[0]
-        taken = _extract(media, 'taken_at', default=None)
-        taken_str = taken.isoformat() if hasattr(taken, 'isoformat') else (str(taken) if taken else None)
-        c.execute('''UPDATE posts SET
-            post_url=?, media_type=COALESCE(?, media_type), caption=?,
-            like_count=?, comment_count=?, view_count=?, play_count=?,
-            taken_at=?, thumbnail_url=?
-            WHERE id=?''',
-            (f"https://www.instagram.com/p/{code}/", media_type,
-             str(_extract(media, 'caption_text', 'caption', default='')),
-             int(_extract(media, 'like_count', 'likes', default=0) or 0),
-             int(_extract(media, 'comment_count', 'comments', default=0) or 0),
-             int(_extract(media, 'view_count', 'views', default=0) or 0),
-             int(_extract(media, 'play_count', 'plays', default=0) or 0),
-             taken_str,
-             str(_extract(media, 'thumbnail_url', 'display_url', default='')),
-             post_id))
-        conn.commit(); conn.close()
-        return post_id
-
-    thumb_url = str(_extract(media, 'thumbnail_url', 'display_url', default=''))
-    taken = _extract(media, 'taken_at', default=None)
-    taken_str = taken.isoformat() if hasattr(taken, 'isoformat') else (str(taken) if taken else None)
-
-    c.execute('''INSERT INTO posts (account_id, post_code, post_url, media_type,
-        caption, like_count, comment_count, view_count, play_count, taken_at,
-        file_path, downloaded, thumbnail_url)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-        (account_id, code, f"https://www.instagram.com/p/{code}/",
-         media_type, str(_extract(media, 'caption_text', 'caption', default='')),
-         int(_extract(media, 'like_count', 'likes', default=0) or 0),
-         int(_extract(media, 'comment_count', 'comments', default=0) or 0),
-         int(_extract(media, 'view_count', 'views', default=0) or 0),
-         int(_extract(media, 'play_count', 'plays', default=0) or 0),
-         taken_str, file_path, 1 if file_path else 0, thumb_url))
-    post_id = c.lastrowid
-    conn.commit(); conn.close()
+    account_id = account[0]
+    taken = extract(media, "taken_at", default=None)
+    taken_str = taken.isoformat() if hasattr(taken, "isoformat") else (str(taken) if taken else "")
+    cur.execute("""
+        INSERT INTO posts (
+            account_id, post_code, post_url, media_type, caption,
+            like_count, comment_count, view_count, play_count, taken_at,
+            file_path, downloaded, thumbnail_url
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(post_code) DO UPDATE SET
+            account_id=excluded.account_id,
+            post_url=excluded.post_url,
+            caption=excluded.caption,
+            like_count=excluded.like_count,
+            comment_count=excluded.comment_count,
+            view_count=excluded.view_count,
+            play_count=excluded.play_count,
+            taken_at=excluded.taken_at,
+            thumbnail_url=excluded.thumbnail_url
+    """, (
+        account_id,
+        code,
+        f"https://www.instagram.com/p/{code}/",
+        str(extract(media, "media_type", "product_type", default="") or ""),
+        str(extract(media, "caption_text", "caption", default="") or ""),
+        int(extract(media, "like_count", "likes", default=0) or 0),
+        int(extract(media, "comment_count", "comments", default=0) or 0),
+        int(extract(media, "view_count", "views", default=0) or 0),
+        int(extract(media, "play_count", "plays", default=0) or 0),
+        taken_str,
+        "",
+        0,
+        str(extract(media, "thumbnail_url", "display_url", default="") or ""),
+    ))
+    post_id = cur.execute(
+        "SELECT id FROM posts WHERE post_code=?", (code,)
+    ).fetchone()[0]
+    conn.commit()
+    conn.close()
     return post_id
 
-def update_post_media_type(post_id, media_type, file_path, thumbnail_url=""):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("UPDATE posts SET media_type=?, file_path=?, thumbnail_url=? WHERE id=?",
-             (media_type, file_path, thumbnail_url, post_id))
-    conn.commit(); conn.close()
+
+def update_post_media(post_id, media_type, file_path, thumbnail_url=""):
+    conn = db_connect()
+    conn.execute("""
+        UPDATE posts
+        SET media_type=?, file_path=?, downloaded=?, thumbnail_url=?
+        WHERE id=?
+    """, (
+        media_type,
+        str(file_path or ""),
+        int(bool(file_path and os.path.exists(file_path))),
+        str(thumbnail_url or ""),
+        post_id,
+    ))
+    conn.commit()
+    conn.close()
+
 
 def save_comment(post_id, comment):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     try:
-        user = _extract(comment, 'user', default={})
-        username = _extract(user, 'username', default='') if user else ''
-        fullname = _extract(user, 'full_name', default='') if user else ''
-        c.execute('''INSERT OR IGNORE INTO comments
-            (post_id, comment_text, commenter_username, commenter_full_name, created_at)
-            VALUES (?,?,?,?,?)''',
-            (post_id, str(_extract(comment, 'text', 'comment_text', default='')),
-             username, fullname,
-             str(_extract(comment, 'created_at_utc', 'created_at', default=''))))
+        user = extract(comment, "user", default={}) or {}
+        username = str(extract(user, "username", default="") or "")
+        fullname = str(extract(user, "full_name", "fullname", default="") or "")
+        text = str(extract(comment, "text", "comment_text", default="") or "")
+        created = str(
+            extract(comment, "created_at_utc", "created_at", default="") or ""
+        )
+        conn = db_connect()
+        conn.execute("""
+            INSERT OR IGNORE INTO comments (
+                post_id, comment_text, commenter_username,
+                commenter_full_name, created_at
+            ) VALUES (?,?,?,?,?)
+        """, (post_id, text, username, fullname, created))
         conn.commit()
-    except Exception as e:
-        print(f"      ⚠️ save_comment: {e}")
-    conn.close()
+        conn.close()
+    except Exception as exc:
+        print(f"⚠️ save_comment: {redact_error(exc)}")
 
-def save_follower(account_id, follower):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+
+def save_follower(account_id, user_obj):
+    username = str(extract(user_obj, "username", default="") or "")
+    if not username:
+        return
+    fullname = str(extract(user_obj, "full_name", "fullname", default="") or "")
     try:
-        c.execute('''INSERT OR IGNORE INTO followers
-            (account_id, username, full_name, first_seen) VALUES (?,?,?,?)''',
-            (account_id, str(_extract(follower, 'username', default='')),
-             str(_extract(follower, 'full_name', default='')), datetime.now().isoformat()))
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO followers(account_id, username, full_name, first_seen)
+            VALUES (?,?,?,?)
+            ON CONFLICT(account_id, username) DO UPDATE SET
+                full_name=excluded.full_name
+        """, (account_id, username, fullname, now_iso()))
         conn.commit()
-    except: pass
-    conn.close()
+        conn.close()
+    except Exception as exc:
+        print(f"⚠️ save_follower: {redact_error(exc)}")
 
-def save_story(account_id, story, file_path, story_url=""):
+
+def save_following(account_id, user_obj):
+    username = str(extract(user_obj, "username", default="") or "")
+    if not username:
+        return
+    fullname = str(extract(user_obj, "full_name", "fullname", default="") or "")
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        taken = _extract(story, 'taken_at', default=None)
-        taken_str = taken.isoformat() if hasattr(taken, 'isoformat') else (str(taken) if taken else None)
-        c.execute('''INSERT OR REPLACE INTO stories
-            (account_id, story_pk, media_type, taken_at, file_path, story_url, downloaded)
-            VALUES (?,?,?,?,?,?,1)''',
-            (account_id, str(_extract(story, 'pk', 'id', default='')),
-             'video' if int(_extract(story, 'media_type', default=1) or 1) == 2 else 'image',
-             taken_str, file_path, story_url))
-        conn.commit(); conn.close()
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO following(account_id, username, full_name, first_seen)
+            VALUES (?,?,?,?)
+            ON CONFLICT(account_id, username) DO UPDATE SET
+                full_name=excluded.full_name
+        """, (account_id, username, fullname, now_iso()))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"⚠️ save_following: {redact_error(exc)}")
+
+
+def save_story(account_id, story, file_path, story_url="", thumbnail_url=""):
+    pk = str(extract(story, "pk", "id", default="") or "")
+    if not pk:
+        return False
+    media_type = "video" if str(extract(story, "video_url", default="") or "") else "image"
+    taken = extract(story, "taken_at", default=None)
+    taken_str = taken.isoformat() if hasattr(taken, "isoformat") else str(taken or "")
+    try:
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO stories(
+                account_id, story_pk, media_type, taken_at, file_path,
+                story_url, downloaded, thumbnail_url
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(story_pk) DO UPDATE SET
+                account_id=excluded.account_id,
+                media_type=excluded.media_type,
+                taken_at=excluded.taken_at,
+                file_path=excluded.file_path,
+                story_url=excluded.story_url,
+                downloaded=excluded.downloaded,
+                thumbnail_url=excluded.thumbnail_url
+        """, (
+            account_id, pk, media_type, taken_str, str(file_path or ""),
+            str(story_url or ""), int(bool(file_path and os.path.exists(file_path))),
+            str(thumbnail_url or ""),
+        ))
+        conn.commit()
+        conn.close()
         return True
-    except Exception as e:
-        print(f"      ⚠️ DB save_story: {e}")
+    except Exception as exc:
+        print(f"⚠️ save_story: {redact_error(exc)}")
         return False
 
+
 def save_highlight_record(account_id, highlight, cover_path=""):
+    pk = str(extract(highlight, "pk", "id", default="") or "")
+    if not pk:
+        return None
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        pk = str(_extract(highlight, 'pk', 'id', default=''))
-        title = str(_extract(highlight, 'title', 'name', default=''))
-        count = int(_extract(highlight, 'media_count', 'item_count', default=0) or 0)
-        cover = str(_extract(highlight, 'cover_url', 'thumbnail_url', default='') or '')
-        c.execute('''INSERT INTO highlights
-            (account_id, highlight_pk, title, media_count, cover_url, cover_path, downloaded)
-            VALUES (?,?,?,?,?,?,?)
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO highlights(
+                account_id, highlight_pk, title, media_count,
+                cover_url, cover_path, downloaded
+            )
+            VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(highlight_pk) DO UPDATE SET
+                account_id=excluded.account_id,
                 title=excluded.title,
                 media_count=excluded.media_count,
                 cover_url=excluded.cover_url,
                 cover_path=excluded.cover_path,
-                downloaded=excluded.downloaded''',
-            (account_id, pk, title, count, cover, cover_path, 1 if cover_path else 0))
-        hid = c.execute("SELECT id FROM highlights WHERE highlight_pk=?", (pk,)).fetchone()[0]
-        conn.commit(); conn.close()
+                downloaded=excluded.downloaded
+        """, (
+            account_id,
+            pk,
+            str(extract(highlight, "title", "name", default="") or ""),
+            int(extract(highlight, "media_count", "item_count", default=0) or 0),
+            str(extract(highlight, "cover_url", "thumbnail_url", default="") or ""),
+            str(cover_path or ""),
+            int(bool(cover_path and os.path.exists(cover_path))),
+        ))
+        hid = conn.execute(
+            "SELECT id FROM highlights WHERE highlight_pk=?", (pk,)
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
         return hid
-    except Exception as e:
-        print(f"      ⚠️ save_highlight: {type(e).__name__}: {str(e)[:120]}")
-        try: conn.close()
-        except Exception: pass
+    except Exception as exc:
+        print(f"⚠️ save_highlight: {redact_error(exc)}")
         return None
 
-def save_highlight_item_record(highlight_id, item, file_path=""):
+
+def save_highlight_item(highlight_id, item, file_path=""):
+    pk = str(extract(item, "pk", "id", default="") or "")
+    if not pk:
+        return False
+    taken = extract(item, "taken_at", default=None)
+    taken_str = taken.isoformat() if hasattr(taken, "isoformat") else str(taken or "")
+    media_type = "video" if extract(item, "video_url", default="") else "image"
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        pk = str(_extract(item, 'pk', 'id', default=''))
-        media_type = 'video' if _extract(item, 'video_url', default='') else 'image'
-        taken = _extract(item, 'taken_at', default=None)
-        taken_str = taken.isoformat() if hasattr(taken, 'isoformat') else (str(taken) if taken else None)
-        video_url = str(_extract(item, 'video_url', default='') or '')
-        c.execute('''INSERT INTO highlight_items
-            (highlight_id, item_pk, media_type, taken_at, file_path, video_url, downloaded)
-            VALUES (?,?,?,?,?,?,?)
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO highlight_items(
+                highlight_id, item_pk, media_type, taken_at, file_path,
+                video_url, downloaded
+            )
+            VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(item_pk) DO UPDATE SET
                 highlight_id=excluded.highlight_id,
                 media_type=excluded.media_type,
                 taken_at=excluded.taken_at,
                 file_path=excluded.file_path,
                 video_url=excluded.video_url,
-                downloaded=excluded.downloaded''',
-            (highlight_id, pk, media_type, taken_str, file_path, video_url, 1 if file_path else 0))
-        conn.commit(); conn.close()
+                downloaded=excluded.downloaded
+        """, (
+            highlight_id, pk, media_type, taken_str, str(file_path or ""),
+            str(extract(item, "video_url", default="") or ""),
+            int(bool(file_path and os.path.exists(file_path))),
+        ))
+        conn.commit()
+        conn.close()
         return True
-    except Exception as e:
-        print(f"      ⚠️ save_highlight_item: {type(e).__name__}: {str(e)[:120]}")
-        try: conn.close()
-        except Exception: pass
+    except Exception as exc:
+        print(f"⚠️ save_highlight_item: {redact_error(exc)}")
         return False
 
-def get_account_id(username):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT id FROM accounts WHERE username=?", (username,))
-    row = c.fetchone(); conn.close()
-    return row[0] if row else None
-
-def get_account_info(username):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM accounts WHERE username=?", (username,))
-    row = c.fetchone(); conn.close()
-    return dict(row) if row else None
-
-def get_posts_with_comments(account_id, limit=None, order='desc'):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    o = 'DESC' if order == 'desc' else 'ASC'
-    l = f'LIMIT {limit}' if limit else ''
-    c.execute(f"SELECT * FROM posts WHERE account_id=? ORDER BY taken_at {o} {l}", (account_id,))
-    posts = [dict(r) for r in c.fetchall()]
-    for post in posts:
-        c.execute("SELECT * FROM comments WHERE post_id=? ORDER BY created_at ASC", (post['id'],))
-        post['comments'] = [dict(r) for r in c.fetchall()]
-    conn.close(); return posts
-
-def get_followers(account_id, limit=None):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    l = f'LIMIT {limit}' if limit else ''
-    c.execute(f"SELECT * FROM followers WHERE account_id=? ORDER BY first_seen ASC {l}", (account_id,))
-    f = [dict(r) for r in c.fetchall()]; conn.close(); return f
-
-
-def get_following(account_id, limit=None):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    l = f'LIMIT {limit}' if limit else ''
-    c.execute(f"SELECT * FROM following WHERE account_id=? ORDER BY first_seen ASC {l}", (account_id,))
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close(); return rows
-
-def save_following(account_id, user_obj):
-    try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute('''INSERT OR IGNORE INTO following
-            (account_id, username, full_name, first_seen) VALUES (?,?,?,?)''',
-            (account_id,
-             str(_extract(user_obj, 'username', default='')),
-             str(_extract(user_obj, 'full_name', 'fullname', default='')),
-             datetime.now().isoformat()))
-        conn.commit(); conn.close(); return True
-    except Exception as e:
-        print(f"      ⚠️ save_following: {e}")
-        try: conn.close()
-        except Exception: pass
-        return False
-
-def get_stories(account_id):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM stories WHERE account_id=? ORDER BY taken_at DESC", (account_id,))
-    s = [dict(r) for r in c.fetchall()]; conn.close(); return s
-
-def get_highlights(account_id):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM highlights WHERE account_id=? ORDER BY title ASC", (account_id,))
-    rows = [dict(r) for r in c.fetchall()]
-    for h in rows:
-        c.execute("SELECT * FROM highlight_items WHERE highlight_id=? ORDER BY taken_at ASC", (h['id'],))
-        h['items'] = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
 
 def save_mention(query, source_type, source_pk, source_url, context,
                  mentioned_username="", mentioned_full_name=""):
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute('''INSERT INTO mentions
-            (query, source_type, source_pk, source_url, context,
-             mentioned_username, mentioned_full_name, created_at)
-            VALUES (?,?,?,?,?,?,?,?)''',
-            (query, source_type, source_pk, source_url, context,
-             mentioned_username, mentioned_full_name, datetime.now().isoformat()))
-        conn.commit(); conn.close()
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO mentions(
+                query, source_type, source_pk, source_url, context,
+                mentioned_username, mentioned_full_name, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+        """, (
+            str(query), source_type, str(source_pk or ""), str(source_url or ""),
+            str(context or "")[:1000], str(mentioned_username or ""),
+            str(mentioned_full_name or ""), now_iso(),
+        ))
+        conn.commit()
+        conn.close()
         return True
-    except Exception as e:
-        print(f"      ⚠️ save_mention: {e}")
+    except Exception as exc:
+        print(f"⚠️ save_mention: {redact_error(exc)}")
         return False
 
+
+def get_posts_with_comments(account_id, limit=None, order="desc"):
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    direction = "DESC" if order == "desc" else "ASC"
+    limit_sql = f"LIMIT {int(limit)}" if limit else ""
+    rows = conn.execute(
+        f"SELECT * FROM posts WHERE account_id=? "
+        f"ORDER BY taken_at {direction} {limit_sql}",
+        (account_id,),
+    ).fetchall()
+    posts = [dict(row) for row in rows]
+    for post in posts:
+        comments = conn.execute(
+            "SELECT * FROM comments WHERE post_id=? ORDER BY created_at ASC",
+            (post["id"],),
+        ).fetchall()
+        post["comments"] = [dict(c) for c in comments]
+    conn.close()
+    return posts
+
+
+def get_followers(account_id, limit=None):
+    conn = db_connect()
+    limit_sql = f"LIMIT {int(limit)}" if limit else ""
+    rows = conn.execute(
+        f"SELECT * FROM followers WHERE account_id=? "
+        f"ORDER BY first_seen ASC {limit_sql}",
+        (account_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_following(account_id, limit=None):
+    conn = db_connect()
+    limit_sql = f"LIMIT {int(limit)}" if limit else ""
+    rows = conn.execute(
+        f"SELECT * FROM following WHERE account_id=? "
+        f"ORDER BY first_seen ASC {limit_sql}",
+        (account_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_stories(account_id):
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM stories WHERE account_id=? ORDER BY taken_at DESC",
+        (account_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_highlights(account_id):
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM highlights WHERE account_id=? ORDER BY title ASC",
+        (account_id,),
+    ).fetchall()
+    result = [dict(row) for row in rows]
+    for item in result:
+        rows2 = conn.execute(
+            "SELECT * FROM highlight_items WHERE highlight_id=? ORDER BY taken_at ASC",
+            (item["id"],),
+        ).fetchall()
+        item["items"] = [dict(x) for x in rows2]
+    conn.close()
+    return result
+
+
 # ============================================================
-# 7. عميل انستغرام (instaharvest-v2) — Anonymous Mode
+# 9. Instagram client manager — atomic Anonymous/Login switch
 # ============================================================
 class InstagramClient:
     _ig = None
-    _mode = CURRENT_MODE if CURRENT_MODE in ("anonymous", "login") else "anonymous"
+    _mode = START_MODE if START_MODE in ("anonymous", "login") else "anonymous"
     _status = "starting"
     _last_error = ""
     _session_loaded = False
     _last_throttle_at = 0.0
     _last_challenge_at = 0.0
-
+    _session_file = None
     _user_id_cache = {}
-    _USER_CACHE_FILE = (
-        "/content/drive/MyDrive/ig_user_cache_v2.json" if IN_COLAB
-        else "ig_user_cache_v2.json"
+    _user_cache_file = (
+        "/content/drive/MyDrive/ig_user_cache_v2.json"
+        if IN_COLAB else "ig_user_cache_v2.json"
     )
+    _THROTTLE_COOLDOWN = 300
 
     @classmethod
     def init_paths(cls):
-        global AUTH_SESSION_FILE
-        AUTH_SESSION_FILE = os.path.join(BASE_PATH, "instaharvest_session.json")
+        cls._session_file = os.path.join(BASE_PATH, "instaharvest_session.json")
         os.makedirs(BASE_PATH, exist_ok=True)
 
     @classmethod
     def _load_user_cache(cls):
-        if not os.path.exists(cls._USER_CACHE_FILE):
+        if not os.path.exists(cls._user_cache_file):
             return
         try:
-            with open(cls._USER_CACHE_FILE, "r", encoding="utf-8") as f:
-                cls._user_id_cache = json.load(f)
-            print(f"✅ تم تحميل {len(cls._user_id_cache)} مستخدم من الـ Cache")
-        except Exception as e:
-            print(f"⚠️ User cache: {type(e).__name__}")
+            with open(cls._user_cache_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                cls._user_id_cache = {str(k): str(v) for k, v in data.items()}
+                print(f"✅ User cache: {len(cls._user_id_cache)} مستخدم")
+        except Exception as exc:
+            print(f"⚠️ User cache: {redact_error(exc)}")
 
     @classmethod
     def _save_user_cache(cls):
         try:
-            with open(cls._USER_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(cls._user_id_cache, f, ensure_ascii=False)
-        except Exception as e:
-            print(f"⚠️ Save user cache: {type(e).__name__}")
+            with open(cls._user_cache_file, "w", encoding="utf-8") as fh:
+                json.dump(cls._user_id_cache, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"⚠️ حفظ User cache: {redact_error(exc)}")
+
+    @classmethod
+    def _set_error(cls, exc):
+        cls._last_error = redact_error(exc)
+        low = cls._last_error.lower()
+        if is_rate_limit_error(exc):
+            cls._last_throttle_at = time.time()
+        if "challenge" in low or "verification" in low or "checkpoint" in low:
+            cls._last_challenge_at = time.time()
+        cls._status = "error"
 
     @classmethod
     def _mode_label(cls):
@@ -837,291 +1253,438 @@ class InstagramClient:
 
     @classmethod
     def get_status(cls):
+        job = get_job_state()
         return {
             "mode": cls._mode,
             "status": cls._status,
             "session_loaded": bool(cls._session_loaded),
+            "throttle_remaining": cls.throttle_remaining(),
+            "last_error": cls._last_error,
+            "job": job,
             "message": (
                 f"✅ {cls._mode_label()} — العميل جاهز"
-                if cls._status == "ready" else
-                "⏳ 🔐 جاري تسجيل الدخول/تحميل الجلسة..."
-                if cls._status == "logging_in" else
-                f"❌ {cls._mode_label()} — {html_escape(cls._last_error or 'خطأ غير محدد')}"
-                if cls._status == "error" else
-                f"ℹ️ {cls._mode_label()} — {cls._status}"
-            )
+                if cls._status == "ready"
+                else f"❌ {cls._mode_label()} — {html_escape(cls._last_error or 'خطأ غير محدد')}"
+                if cls._status == "error"
+                else f"⏳ {cls._mode_label()} — {cls._status}"
+            ),
         }
 
     @classmethod
-    def _record_error(cls, exc):
-        cls._last_error = (str(exc).strip() or type(exc).__name__)[:700]
-        low = cls._last_error.lower()
-        if "429" in low or "too many requests" in low:
-            cls._last_throttle_at = time.time()
-        if "challenge" in low or "verification" in low:
-            cls._last_challenge_at = time.time()
-        cls._status = "error"
-
-    @classmethod
     def is_throttled(cls):
-        return bool(cls._last_throttle_at and time.time() - cls._last_throttle_at < 300)
+        return bool(
+            cls._last_throttle_at and
+            time.time() - cls._last_throttle_at < cls._THROTTLE_COOLDOWN
+        )
 
     @classmethod
     def throttle_remaining(cls):
-        return max(0, int(300 - (time.time() - cls._last_throttle_at))) if cls._last_throttle_at else 0
+        if not cls._last_throttle_at:
+            return 0
+        return max(
+            0,
+            int(cls._THROTTLE_COOLDOWN - (time.time() - cls._last_throttle_at)),
+        )
 
     @classmethod
-    def _make_anonymous(cls):
-        cls._ig = Instagram.anonymous(unlimited=True)
-        cls._mode = "anonymous"
-        cls._status = "ready"
-        cls._session_loaded = False
-        cls._last_error = ""
-        print("🔓 Anonymous Mode — جاهز")
+    def mark_throttle(cls, exc=None):
+        cls._last_throttle_at = time.time()
+        if exc:
+            cls._last_error = redact_error(exc)
+        print(f"🛑 Instagram throttle: تهدئة {cls._THROTTLE_COOLDOWN}s")
 
     @classmethod
-    def _make_login(cls):
-        cls._status = "logging_in"
-        cls._last_error = ""
+    def human_delay(cls, a=1.0, b=2.0):
+        time.sleep(random.uniform(a, b))
+
+    @classmethod
+    def _build_anonymous(cls):
+        print("🔓 إنشاء عميل Anonymous...")
+        ig = Instagram.anonymous(unlimited=True)
+        return ig
+
+    @classmethod
+    def _build_login(cls):
+        if not IG_USERNAME or not IG_PASSWORD:
+            raise RuntimeError(
+                "بيانات Login غير موجودة. ضع IG_USERNAME وIG_PASSWORD "
+                "في متغيرات البيئة داخل Colab قبل طلب Login."
+            )
+
         ig = Instagram()
 
-        if AUTH_SESSION_FILE and os.path.exists(AUTH_SESSION_FILE):
+        # Reuse the session first. It avoids an unnecessary password login.
+        if cls._session_file and os.path.exists(cls._session_file):
             try:
-                ig.auth.load_session(AUTH_SESSION_FILE)
+                print(f"♻️ محاولة تحميل جلسة: {cls._session_file}")
+                ig.auth.load_session(cls._session_file)
                 valid = True
                 if hasattr(ig.auth, "validate_session"):
-                    result = ig.auth.validate_session()
-                    if result is False:
-                        valid = False
+                    validation = ig.auth.validate_session()
+                    valid = validation is not False
                 if valid:
-                    cls._ig = ig
-                    cls._mode = "login"
-                    cls._status = "ready"
-                    cls._session_loaded = True
-                    print(f"♻️ تم تحميل جلسة الأداة من: {AUTH_SESSION_FILE}")
-                    return ig
-                print("⚠️ الجلسة المحفوظة غير صالحة.")
-            except Exception as e:
-                print(f"⚠️ فشل تحميل الجلسة: {type(e).__name__}: {str(e)[:180]}")
+                    print("✅ الجلسة المحفوظة صالحة.")
+                    return ig, True
+                print("⚠️ الجلسة المحفوظة غير صالحة؛ سيتم تسجيل الدخول.")
+            except Exception as exc:
+                print(f"⚠️ تعذر استخدام الجلسة المحفوظة: {redact_error(exc)}")
 
-        if not IG_USERNAME or not IG_PASSWORD:
-            raise RuntimeError("IG_USERNAME و IG_PASSWORD مطلوبان لوضع Login.")
-
-        try:
-            result = ig.login(IG_USERNAME, IG_PASSWORD)
-            if result is False:
-                raise RuntimeError("Instagram رفض تسجيل الدخول.")
-            if AUTH_SESSION_FILE:
-                ig.auth.save_session(AUTH_SESSION_FILE)
-            cls._ig = ig
-            cls._mode = "login"
-            cls._status = "ready"
-            cls._session_loaded = False
-            cls._last_error = ""
-            print(f"✅ Login ناجح — جلسة الأداة محفوظة في {AUTH_SESSION_FILE}")
-            return ig
-        except Exception:
-            cls._ig = None
-            raise
+        print(f"🔐 محاولة Login للحساب: {IG_USERNAME}")
+        result = ig.login(IG_USERNAME, IG_PASSWORD)
+        if result is False:
+            raise RuntimeError("المكتبة أعادت False من ig.login().")
+        if cls._session_file:
+            try:
+                ig.auth.save_session(cls._session_file)
+                print(f"💾 تم حفظ جلسة Login: {cls._session_file}")
+            except Exception as exc:
+                print(f"⚠️ تعذر حفظ الجلسة: {redact_error(exc)}")
+        return ig, False
 
     @classmethod
-    def switch_mode(cls, mode):
-        mode = str(mode or "").strip().lower()
-        if mode not in ("anonymous", "login"):
+    def switch_mode(cls, requested_mode):
+        requested_mode = str(requested_mode or "").strip().lower()
+        if requested_mode not in ("anonymous", "login"):
             raise ValueError("الوضع يجب أن يكون anonymous أو login")
 
-        with INSTAGRAM_JOB_LOCK:
-            cls._ig = None
-            cls._session_loaded = False
+        with CLIENT_SWITCH_LOCK:
+            if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+                raise RuntimeError("لا يمكن تبديل الوضع أثناء تنفيذ مهمة سكراب/بحث.")
+
+            old_ig = cls._ig
+            old_mode = cls._mode
+            old_status = cls._status
+            old_error = cls._last_error
+            old_session_loaded = cls._session_loaded
+
             try:
-                if mode == "anonymous":
-                    cls._make_anonymous()
+                cls._status = "switching"
+                cls._last_error = ""
+
+                if requested_mode == "anonymous":
+                    new_ig = cls._build_anonymous()
+                    new_session_loaded = False
                 else:
-                    cls._make_login()
-            except Exception as e:
-                cls._record_error(e)
-                if mode == "login":
-                    # أبقِ الصفحة والسيرفر قابلين للاستخدام حتى يفشل Login.
-                    try:
-                        cls._make_anonymous()
-                        print("↩️ عاد العميل إلى Anonymous بعد فشل Login")
-                    except Exception:
-                        pass
+                    new_ig, new_session_loaded = cls._build_login()
+
+                # Atomic commit: only replace the active client after success.
+                cls._ig = new_ig
+                cls._mode = requested_mode
+                cls._status = "ready"
+                cls._session_loaded = new_session_loaded
+                print(f"✅ تم تفعيل {cls._mode_label()}")
+                return cls.get_status()
+
+            except Exception as exc:
+                cls._ig = old_ig
+                cls._mode = old_mode
+                cls._status = old_status if old_ig is not None else "error"
+                cls._session_loaded = old_session_loaded
+                cls._last_error = redact_error(exc)
+                if is_rate_limit_error(exc):
+                    cls._last_throttle_at = time.time()
+                if "challenge" in cls._last_error.lower() or "checkpoint" in cls._last_error.lower():
+                    cls._last_challenge_at = time.time()
+                print(
+                    f"❌ فشل تفعيل {requested_mode}; "
+                    f"تم الإبقاء على {cls._mode_label()}: {cls._last_error}"
+                )
                 raise
-        return cls.get_status()
+            finally:
+                INSTAGRAM_JOB_LOCK.release()
 
     @classmethod
     def get_client(cls):
-        if cls._ig is not None and cls._status == "ready":
-            return cls._ig
-        cls._load_user_cache()
-        try:
-            return cls._make_login() if cls._mode == "login" else cls._make_anonymous() or cls._ig
-        except Exception as e:
-            cls._record_error(e)
-            return None
+        with CLIENT_SWITCH_LOCK:
+            if cls._ig is not None and cls._status == "ready":
+                return cls._ig
+
+            cls._load_user_cache()
+            try:
+                cls._status = "starting"
+                if cls._mode == "anonymous":
+                    cls._ig = cls._build_anonymous()
+                    cls._session_loaded = False
+                else:
+                    cls._ig, cls._session_loaded = cls._build_login()
+                cls._status = "ready"
+                cls._last_error = ""
+                return cls._ig
+            except Exception as exc:
+                cls._ig = None
+                cls._set_error(exc)
+                print(f"❌ إنشاء عميل Instagram: {redact_error(exc)}")
+                return None
 
     @classmethod
     def refresh_if_needed(cls):
-        return cls.get_client() is not None and cls._status == "ready"
+        if cls._ig is None or cls._status != "ready":
+            return False
+        if cls.is_throttled():
+            print(
+                f"🛑 Instagram في تهدئة؛ المتبقي {cls.throttle_remaining()}s"
+            )
+            return False
+        return True
 
-    @classmethod
-    def human_delay(cls, a=0.8, b=2.2):
-        time.sleep(random.uniform(a, b))
 
 # ============================================================
-# 8. 🔍 محرك البحث الشامل
+# 10. Universal Search
 # ============================================================
 class UniversalSearcher:
     def __init__(self, ig):
         self.ig = ig
 
     def analyze_query(self, query):
-        query = query.strip()
-        analysis = {'original': query, 'clean': query, 'type': 'general', 'targets': [], 'keywords': []}
-
-        if query.startswith('#'):
-            analysis['type'] = 'hashtag'
-            analysis['clean'] = query[1:].strip()
-            return analysis
-
-        if query.startswith('@'):
-            analysis['type'] = 'user'
-            analysis['clean'] = query[1:].strip()
-            return analysis
-
-        if 'instagram.com' in query:
-            m = re.search(r'instagram\.com/([A-Za-z0-9_.]+)', query)
-            if m:
-                analysis['type'] = 'user'
-                analysis['clean'] = m.group(1)
-                return analysis
-
-        words = query.split()
-        analysis['keywords'] = [w for w in words if len(w) > 2]
-        analysis['type'] = 'general'
-        return analysis
-
-    def _call_media_comments(self, media_pk, max_count=20):
-        try:
-            if hasattr(self.ig, "media") and hasattr(self.ig.media, "get_comments_parsed"):
-                return list(self.ig.media.get_comments_parsed(media_pk) or [])[:max_count]
-        except Exception:
-            pass
-        return []
-
-    def _hunt_mentions(self, query, max_posts=5, max_comments_per_post=20):
-        clean = str(query or "").lower().replace("#","").replace("@","").strip()
-        if not clean:
-            return []
-        mentions = []
-        try:
-            posts = list(self.ig.public.get_hashtag_posts(clean, max_count=max_posts) or [])
-        except Exception:
-            posts = []
-        for media in posts[:max_posts]:
-            pk = str(_extract(media, 'pk','id',default=''))
-            code = str(_extract(media, 'code','shortcode',default=''))
-            source = f"https://www.instagram.com/p/{code}/"
-            caption = str(_extract(media,'caption_text','caption',default='') or '')
-            if clean in caption.lower():
-                mentions.append({'type':'caption','source_pk':pk,'source_url':source,
-                                 'context':caption[:500],'mentioned_username':clean,
-                                 'mentioned_full_name':''})
-                save_mention(clean,'caption',pk,source,caption[:500],clean,'')
-
-            try:
-                comments = self._call_media_comments(pk, max_comments_per_post)
-                for comment in comments:
-                    txt = str(_extract(comment,'text','comment_text',default='') or '')
-                    if clean not in txt.lower():
-                        continue
-                    user = _extract(comment,'user',default={})
-                    uname = str(_extract(user,'username',default=''))
-                    fullname = str(_extract(user,'full_name','fullname',default=''))
-                    mentions.append({'type':'comment','source_pk':pk,'source_url':source,
-                                     'context':txt[:500],'commenter':uname,
-                                     'commenter_full_name':fullname})
-                    save_mention(clean,'comment',pk,source,txt[:500],uname,fullname)
-            except Exception:
-                pass
-            InstagramClient.human_delay(0.4,0.9)
-        return mentions
-
-    def search(self, query, max_results_per_type=10, hunt_mentions=True):
-        analysis = self.analyze_query(query)
-        print(f"🔍 بحث شامل: '{query}' — النوع: {analysis['type']}")
-        results = {
-            'analysis': analysis,
-            'users': [], 'hashtags': [], 'posts': [],
-            'reels': [], 'mentions': [], 'stats': {'total': 0}
+        q = str(query or "").strip()
+        analysis = {
+            "original": q,
+            "clean": q,
+            "type": "general",
+            "keywords": [],
         }
 
-        if analysis['type'] == 'user':
-            name = analysis['clean']
+        if re.search(r"instagram\.com/(?:p|reel|tv)/", q, re.I):
+            analysis["type"] = "media_url"
+            analysis["clean"] = q
+            analysis["shortcode"] = parse_shortcode_from_url(q)
+            return analysis
+
+        profile_match = re.search(
+            r"instagram\.com/([A-Za-z0-9_.]+)/?$", q, re.I
+        )
+        if profile_match:
+            candidate = profile_match.group(1)
+            if candidate.lower() not in {"p", "reel", "tv", "explore"}:
+                analysis["type"] = "user"
+                analysis["clean"] = candidate
+                return analysis
+
+        if q.startswith("#"):
+            analysis["type"] = "hashtag"
+            analysis["clean"] = q[1:].strip()
+            return analysis
+
+        if q.startswith("@"):
+            analysis["type"] = "user"
+            analysis["clean"] = q[1:].strip()
+            return analysis
+
+        analysis["keywords"] = [w for w in q.split() if len(w.strip()) >= 3]
+        return analysis
+
+    def _call(self, root, dotted, *args, **kwargs):
+        current = root
+        for part in dotted.split("."):
+            if not hasattr(current, part):
+                return None
+            current = getattr(current, part)
+        try:
+            return current(*args, **kwargs)
+        except TypeError:
+            # Some versions expose a method with fewer optional args.
+            if kwargs:
+                try:
+                    return current(*args)
+                except Exception:
+                    return None
+            return None
+
+    def _search_general(self, query, limit):
+        results = []
+        try:
+            if hasattr(self.ig, "public") and hasattr(self.ig.public, "search"):
+                results = as_list(self.ig.public.search(query))
+        except Exception as exc:
+            print(f"⚠️ public.search: {redact_error(exc)}")
+        return results[:limit]
+
+    def _hunt_mentions(self, query, max_posts=5, max_comments=20):
+        tokens = [t.lstrip("#@") for t in re.findall(r"[A-Za-z0-9_.-]+", str(query or ""))]
+        tokens = [t for t in tokens if len(t) >= 3][:3]
+        mentions = []
+
+        for token in tokens:
             try:
-                if InstagramClient._mode == 'login' and hasattr(self.ig, 'users'):
-                    u = self.ig.users.get_full_profile(name)
+                posts = as_list(
+                    self.ig.public.get_hashtag_posts(token, max_count=max_posts)
+                )
+            except Exception as exc:
+                print(f"⚠️ mention hashtag @{token}: {redact_error(exc)}")
+                continue
+
+            for media in posts[:max_posts]:
+                pk = str(extract(media, "pk", "id", default="") or "")
+                code = str(extract(media, "code", "shortcode", default="") or "")
+                source_url = f"https://www.instagram.com/p/{code}/"
+                caption = str(extract(media, "caption_text", "caption", default="") or "")
+                if token.lower() in caption.lower():
+                    item = {
+                        "type": "caption",
+                        "source_pk": pk,
+                        "source_url": source_url,
+                        "context": caption[:500],
+                        "mentioned_username": token,
+                        "mentioned_full_name": "",
+                    }
+                    mentions.append(item)
+                    save_mention(
+                        token, "caption", pk, source_url, caption[:500], token, ""
+                    )
+
+                try:
+                    comments = as_list(
+                        self._call(
+                            self.ig.public, "get_comments",
+                            code, max_count=max_comments
+                        )
+                    )
+                except Exception:
+                    comments = []
+
+                for comment in comments:
+                    text_value = str(
+                        extract(comment, "text", "comment_text", default="") or ""
+                    )
+                    if token.lower() not in text_value.lower():
+                        continue
+                    user = extract(comment, "user", default={}) or {}
+                    uname = str(extract(user, "username", default="") or "")
+                    fullname = str(
+                        extract(user, "full_name", "fullname", default="") or ""
+                    )
+                    item = {
+                        "type": "comment",
+                        "source_pk": pk,
+                        "source_url": source_url,
+                        "context": text_value[:500],
+                        "commenter": uname,
+                        "commenter_full_name": fullname,
+                    }
+                    mentions.append(item)
+                    save_mention(
+                        token, "comment", pk, source_url,
+                        text_value[:500], uname, fullname
+                    )
+            InstagramClient.human_delay(0.3, 0.7)
+
+        return mentions
+
+    def search(self, query, max_results_per_type=10, hunt_mentions=False):
+        if not InstagramClient.refresh_if_needed():
+            raise RuntimeError("عميل Instagram غير جاهز أو في فترة تهدئة.")
+
+        analysis = self.analyze_query(query)
+        limit = safe_int(max_results_per_type, 10, 1, 50)
+        results = {
+            "analysis": analysis,
+            "users": [],
+            "hashtags": [],
+            "posts": [],
+            "reels": [],
+            "mentions": [],
+            "stats": {"total": 0},
+        }
+        print(f"🔍 بحث: {query} | النوع={analysis['type']}")
+
+        if analysis["type"] == "user":
+            username = analysis["clean"]
+            try:
+                if InstagramClient._mode == "login" and hasattr(self.ig, "users"):
+                    user = self.ig.users.get_full_profile(username)
                 else:
-                    u = self.ig.public.get_profile(name)
-                if u: results['users'] = [u]
-            except Exception as e:
-                print(f"   ⚠️ profile: {type(e).__name__}: {str(e)[:120]}")
+                    user = self.ig.public.get_profile(username)
+                if user:
+                    results["users"] = [user]
+            except Exception as exc:
+                print(f"⚠️ profile: {redact_error(exc)}")
 
             try:
-                results['posts'] = list(self.ig.public.get_posts(name, max_count=max_results_per_type) or [])
-            except Exception:
-                if InstagramClient._mode == 'login' and results['users']:
+                results["posts"] = as_list(
+                    self.ig.public.get_posts(username, max_count=limit)
+                )[:limit]
+            except Exception as exc:
+                print(f"⚠️ user posts public: {redact_error(exc)}")
+                if InstagramClient._mode == "login":
                     try:
-                        uid = str(_extract(results['users'][0],'pk','id',default=''))
-                        results['posts'] = list(self.ig.feed.get_all_posts(uid, max_posts=max_results_per_type, delay=1.0) or [])
-                    except Exception:
-                        pass
+                        uid = str(extract(results["users"][0], "pk", "id", default=""))
+                        results["posts"] = as_list(
+                            self._call(
+                                self.ig.feed, "get_all_posts",
+                                uid, max_posts=limit, delay=1.0
+                            )
+                        )[:limit]
+                    except Exception as exc2:
+                        print(f"⚠️ user posts private fallback: {redact_error(exc2)}")
+
             try:
-                results['reels'] = list(self.ig.public.get_reels(name, max_count=max_results_per_type) or [])
+                results["reels"] = as_list(
+                    self.ig.public.get_reels(username, max_count=limit)
+                )[:limit]
             except Exception:
                 pass
 
-        elif analysis['type'] == 'hashtag':
-            tag = analysis['clean']
+        elif analysis["type"] == "media_url":
+            url = analysis["clean"]
             try:
-                results['posts'] = list(self.ig.public.get_hashtag_posts(tag, max_count=max_results_per_type) or [])
-                results['hashtags'] = [{'name':tag,'media_count':len(results['posts'])}]
-            except Exception:
-                if InstagramClient._mode == 'login' and hasattr(self.ig, 'search'):
+                media = self.ig.public.get_post_by_url(url)
+                if media:
+                    results["posts"] = [media]
+            except Exception as exc:
+                print(f"⚠️ get_post_by_url: {redact_error(exc)}")
+                if analysis.get("shortcode") and hasattr(self.ig, "media"):
                     try:
-                        results['hashtags'] = list(self.ig.search.search_hashtags(tag) or [])[:max_results_per_type]
+                        media = self.ig.media.get_by_shortcode(analysis["shortcode"])
+                        if media:
+                            results["posts"] = [media]
+                    except Exception as exc2:
+                        print(f"⚠️ media.get_by_shortcode: {redact_error(exc2)}")
+
+        elif analysis["type"] == "hashtag":
+            tag = analysis["clean"]
+            try:
+                posts = as_list(
+                    self.ig.public.get_hashtag_posts(tag, max_count=limit)
+                )
+                results["posts"] = posts[:limit]
+                results["hashtags"] = [{
+                    "name": tag,
+                    "media_count": len(posts),
+                }]
+            except Exception as exc:
+                print(f"⚠️ hashtag posts: {redact_error(exc)}")
+                if hasattr(self.ig, "search"):
+                    try:
+                        results["hashtags"] = as_list(
+                            self.ig.search.search_hashtags(tag)
+                        )[:limit]
                     except Exception:
                         pass
 
         else:
-            if InstagramClient._mode == 'login' and hasattr(self.ig, 'search'):
+            results["users"] = self._search_general(query, limit)
+            if InstagramClient._mode == "login" and hasattr(self.ig, "search"):
                 try:
-                    results['users'] = list(self.ig.search.search_users(query) or [])[:max_results_per_type]
+                    results["users"] = as_list(
+                        self.ig.search.search_users(query)
+                    )[:limit] or results["users"]
                 except Exception:
                     pass
                 try:
-                    results['hashtags'] = list(self.ig.search.search_hashtags(query) or [])[:max_results_per_type]
+                    results["hashtags"] = as_list(
+                        self.ig.search.search_hashtags(query)
+                    )[:limit]
                 except Exception:
                     pass
-            elif hasattr(self.ig, 'public'):
-                try:
-                    results['users'] = list(self.ig.public.search(query) or [])[:max_results_per_type]
-                except Exception:
-                    try:
-                        u = self.ig.public.get_profile(query)
-                        if u: results['users'] = [u]
-                    except Exception:
-                        pass
 
-        if hunt_mentions and analysis['type'] == 'general':
-            results['mentions'] = self._hunt_mentions(
-                query, max_posts=min(5,max_results_per_type),
-                max_comments_per_post=20
+        if hunt_mentions:
+            results["mentions"] = self._hunt_mentions(
+                query, max_posts=min(5, limit), max_comments=20
             )
 
-        results['stats']['total'] = sum(
-            len(results[k]) for k in ('users','hashtags','posts','reels','mentions')
+        results["stats"]["total"] = sum(
+            len(results[k]) for k in
+            ("users", "hashtags", "posts", "reels", "mentions")
         )
         self._save_search_results(query, results)
         self._send_summary(query, results)
@@ -1129,250 +1692,390 @@ class UniversalSearcher:
 
     def _save_search_results(self, query, results):
         try:
-            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-            for rtype in ['users', 'hashtags', 'posts', 'reels', 'mentions']:
-                for item in results[rtype]:
-                    username = str(_extract(item, 'username', 'commenter', default=''))
-                    full_name = str(_extract(item, 'full_name', 'fullname', 'commenter_full_name', default=''))
-                    pk = str(_extract(item, 'pk', 'id', 'source_pk', default=''))
-                    c.execute('''INSERT INTO search_results
-                        (query, result_type, username, full_name, pk, extra_data, created_at)
-                        VALUES (?,?,?,?,?,?,?)''',
-                        (query, rtype, username, full_name, pk, '{}', datetime.now().isoformat()))
-            conn.commit(); conn.close()
-        except Exception as e:
-            print(f"⚠️ حفظ نتائج البحث: {e}")
+            conn = db_connect()
+            for rtype in ("users", "hashtags", "posts", "reels", "mentions"):
+                for item in results.get(rtype, []):
+                    username = str(extract(
+                        item, "username", "commenter", default=""
+                    ) or "")
+                    fullname = str(extract(
+                        item, "full_name", "fullname",
+                        "commenter_full_name", default=""
+                    ) or "")
+                    pk = str(extract(
+                        item, "pk", "id", "source_pk", default=""
+                    ) or "")
+                    conn.execute("""
+                        INSERT INTO search_results(
+                            query, result_type, username, full_name,
+                            pk, extra_data, created_at
+                        ) VALUES(?,?,?,?,?,?,?)
+                    """, (
+                        query, rtype, username, fullname, pk, "{}",
+                        now_iso(),
+                    ))
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            print(f"⚠️ حفظ نتائج البحث: {redact_error(exc)}")
 
     def _send_summary(self, query, results):
-        summary_lines = [f"🔍 *نتائج البحث الشامل*\n📝 الاستعلام: `{query}`\n"]
-
-        if results['users']:
-            summary_lines.append(f"👤 مستخدمين: {len(results['users'])}")
-            for u in results['users'][:3]:
-                uname = _extract(u, 'username', default='?')
-                summary_lines.append(f"   • @{uname}")
-
-        if results['hashtags']:
-            summary_lines.append(f"#️⃣ هاشتاجات: {len(results['hashtags'])}")
-
-        if results['posts']:
-            summary_lines.append(f"📸 منشورات: {len(results['posts'])}")
-
-        TelegramSender.send_message("\n".join(summary_lines))
+        lines = [
+            "<b>🔍 نتائج البحث الشامل</b>",
+            f"📝 {html_escape(str(query))}",
+        ]
+        if results["users"]:
+            lines.append(f"👤 المستخدمون: {len(results['users'])}")
+            for user in results["users"][:5]:
+                lines.append(
+                    f"• @{html_escape(str(extract(user, 'username', default='?')))}"
+                )
+        if results["hashtags"]:
+            lines.append(f"#️⃣ الهاشتاجات: {len(results['hashtags'])}")
+        if results["posts"]:
+            lines.append(f"📸 المنشورات: {len(results['posts'])}")
+        if results["reels"]:
+            lines.append(f"🎬 الريلز: {len(results['reels'])}")
+        if results["mentions"]:
+            lines.append(f"🔎 المطابقات النصية: {len(results['mentions'])}")
+        TelegramSender.send_message_html("\n".join(lines))
 
     def generate_search_report(self, query, results):
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M')
-        sections_html = []
+        sections = []
+        if results["users"]:
+            cards = []
+            for user in results["users"]:
+                username = html_escape(str(extract(user, "username", default="?") or "?"))
+                fullname = html_escape(str(
+                    extract(user, "full_name", "fullname", default="") or ""
+                ))
+                followers = int(
+                    extract(user, "follower_count", "followers", default=0) or 0
+                )
+                pic_url = str(extract(
+                    user, "profile_pic_url", "profile_pic_url_hd", default=""
+                ) or "")
+                b64 = ThumbnailEngine.from_url(pic_url, 80, 50, f"user_{username}") if pic_url else None
+                pic = (
+                    f'<img src="data:image/jpeg;base64,{b64}" class="user-pic">'
+                    if b64 else '<div class="user-pic placeholder">👤</div>'
+                )
+                cards.append(
+                    f'<div class="user-card">{pic}<div>'
+                    f'<b>@{username}</b><div>{fullname}</div>'
+                    f'<small>👥 {followers:,}</small></div></div>'
+                )
+            sections.append(
+                f'<section class="section"><h2>👤 المستخدمون ({len(cards)})</h2>'
+                f'<div class="users-grid">{"".join(cards)}</div></section>'
+            )
 
-        # ============ المستخدمين ============
-        if results['users']:
-            items_html = ""
-            for u in results['users']:
-                pic_url = str(_extract(u, 'profile_pic_url', 'profile_pic_url_hd', default=''))
-                pic_b64 = ThumbnailEngine.from_url(pic_url, 80, 50, cache_key=f"u_{_extract(u, 'username')}") if pic_url else None
-                pic_tag = (f"<img src='data:image/jpeg;base64,{pic_b64}' class='user-pic'>"
-                          if pic_b64 else "<div class='user-pic placeholder'>👤</div>")
+        if results["posts"]:
+            cards = []
+            for media in results["posts"]:
+                code = html_escape(str(extract(media, "code", "shortcode", default="") or ""))
+                caption = html_escape(str(
+                    extract(media, "caption_text", "caption", default="") or ""
+                )[:250])
+                likes = int(extract(media, "like_count", "likes", default=0) or 0)
+                comments = int(extract(media, "comment_count", "comments", default=0) or 0)
+                thumb_url = str(extract(
+                    media, "thumbnail_url", "display_url", default=""
+                ) or "")
+                b64 = ThumbnailEngine.from_url(
+                    thumb_url, THUMB_MAX_SIZE, THUMB_QUALITY, f"search_{code}"
+                ) if thumb_url else None
+                if not b64:
+                    b64 = ThumbnailEngine.placeholder_svg("📷")
+                cards.append(
+                    f'<div class="search-card">'
+                    f'<a href="https://www.instagram.com/p/{code}" target="_blank">'
+                    f'<img src="data:image/jpeg;base64,{b64}" class="search-thumb"></a>'
+                    f'<div class="search-info"><div>❤️ {likes:,} · 💬 {comments:,}</div>'
+                    f'<div>{caption}</div>'
+                    f'<a href="https://www.instagram.com/p/{code}" target="_blank">🔗 فتح</a></div>'
+                    f'</div>'
+                )
+            sections.append(
+                f'<section class="section"><h2>📸 المنشورات ({len(cards)})</h2>'
+                f'<div class="search-grid">{"".join(cards)}</div></section>'
+            )
 
-                followers = int(_extract(u, 'follower_count', 'followers', default=0) or 0)
-                bio = str(_extract(u, 'biography', 'bio', default=''))[:150]
-
-                items_html += f'''<div class="user-card">
-                    {pic_tag}
-                    <div class="user-info">
-                        <div class="user-username">@{_extract(u, 'username', default='?')}</div>
-                        <div class="user-name">{_extract(u, 'full_name', 'fullname', default='')}</div>
-                        <div class="user-stats">👥 {followers:,} متابع</div>
-                        <div class="user-bio">{bio}</div>
-                    </div>
-                </div>'''
-            sections_html.append(f'''<section class="section">
-                <h2 class="section-title">👤 المستخدمون ({len(results['users'])})</h2>
-                <div class="users-grid">{items_html}</div>
-            </section>''')
-
-        # ============ المنشورات ============
-        if results['posts']:
-            items_html = ""
-            for p in results['posts']:
-                thumb_url = str(_extract(p, 'thumbnail_url', 'display_url', default=''))
-                thumb_b64 = None
-                if thumb_url:
-                    thumb_b64 = ThumbnailEngine.from_url(
-                        thumb_url, THUMB_MAX_SIZE, THUMB_QUALITY,
-                        cache_key=f"p_{_extract(p, 'code', 'shortcode', default='')}")
-                if not thumb_b64:
-                    thumb_b64 = ThumbnailEngine.placeholder_svg('📷')
-
-                code = _extract(p, 'code', 'shortcode', default='')
-                caption = str(_extract(p, 'caption_text', 'caption', default=''))[:200]
-                likes = int(_extract(p, 'like_count', 'likes', default=0) or 0)
-                comments = int(_extract(p, 'comment_count', 'comments', default=0) or 0)
-
-                items_html += f'''<div class="search-post-card">
-                    <a href="https://instagram.com/p/{code}" target="_blank" class="post-thumb-wrap">
-                        <img src="data:image/jpeg;base64,{thumb_b64}" class="post-thumb" loading="lazy">
-                    </a>
-                    <div class="search-post-info">
-                        <div class="post-stats">❤️ {likes:,} — 💬 {comments:,}</div>
-                        <div class="post-caption">{caption}</div>
-                        <a href="https://instagram.com/p/{code}" target="_blank" class="post-link">🔗 فتح</a>
-                    </div>
-                </div>'''
-            sections_html.append(f'''<section class="section">
-                <h2 class="section-title">📸 المنشورات ({len(results['posts'])})</h2>
-                <div class="search-posts-grid">{items_html}</div>
-            </section>''')
+        if results["mentions"]:
+            rows = []
+            for mention in results["mentions"]:
+                rows.append(
+                    f'<div class="mention-row"><b>{html_escape(str(mention.get("type","")))}</b> '
+                    f'· {html_escape(str(mention.get("context",""))[:500])} '
+                    f'<a href="{html_escape(str(mention.get("source_url","")))}" target="_blank">فتح</a></div>'
+                )
+            sections.append(
+                f'<section class="section"><h2>🔎 Mention Hunter ({len(rows)})</h2>'
+                + "".join(rows) + "</section>"
+            )
 
         css = """
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Tahoma,Arial,sans-serif;
-background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
-background-attachment:fixed;color:#e0e0e0;line-height:1.6;padding:16px;min-height:100vh}
-.container{max-width:1200px;margin:0 auto}
-.header{background:linear-gradient(135deg,#e94560 0%,#c73659 100%);
-padding:30px;border-radius:20px;margin-bottom:20px;text-align:center}
-.section{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);
-border-radius:16px;padding:20px;margin-bottom:20px}
-.section-title{font-size:1.2rem;color:#e94560;margin-bottom:16px;
-padding-bottom:10px;border-bottom:2px solid #e94560}
-.users-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.user-card{background:rgba(0,0,0,0.2);border-radius:12px;padding:14px;
-display:flex;gap:12px;border:1px solid rgba(233,69,96,0.25)}
-.user-pic{width:60px;height:60px;border-radius:50%;object-fit:cover;border:2px solid #e94560}
-.search-posts-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
-.search-post-card{background:rgba(0,0,0,0.2);border-radius:12px;overflow:hidden;
-border:1px solid rgba(233,69,96,0.25);display:flex}
-.post-thumb-wrap{width:120px;flex-shrink:0}
-.post-thumb{width:100%;aspect-ratio:1/1;object-fit:cover}
-.search-post-info{flex:1;padding:10px}
-.post-link{color:#64b5f6;text-decoration:none;font-size:0.75rem}
+*{box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#1a1a2e,#0f3460);
+color:#e9edf2;padding:16px;line-height:1.6}
+.container{max-width:1100px;margin:auto}
+.header,.section{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
+border-radius:16px;padding:20px;margin-bottom:16px}
+.header{text-align:center;background:linear-gradient(135deg,#e94560,#c73659)}
+.users-grid,.search-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.user-card,.search-card{background:rgba(0,0,0,.22);border-radius:12px;padding:12px}
+.user-card{display:flex;gap:12px}
+.user-pic{width:70px;height:70px;border-radius:50%;object-fit:cover;flex:none}
+.search-card{display:flex;gap:10px}
+.search-thumb{width:130px;height:130px;object-fit:cover;border-radius:9px}
+.search-info{padding:4px;overflow-wrap:anywhere}
+.placeholder{display:flex;align-items:center;justify-content:center;background:#24263b}
+a{color:#7cc7ff}
+.mention-row{padding:10px;border-bottom:1px solid rgba(255,255,255,.1)}
 """
-        html = f"""<!DOCTYPE html>
-<html lang="ar" dir="rtl"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>تقرير بحث — {query}</title><style>{css}</style></head>
-<body><div class="container">
-<div class="header"><h1>🔍 تقرير البحث الشامل</h1>
-<div>📝 {query}</div><div>📅 {ts}</div></div>
-{''.join(sections_html)}
-</div></body></html>"""
+        safe_query = safe_name(query, "search")
+        report = (
+            "<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'>"
+            f"<title>بحث — {html_escape(str(query))}</title><style>{css}</style></head>"
+            "<body><div class='container'>"
+            f"<div class='header'><h1>🔍 تقرير البحث</h1><div>{html_escape(str(query))}</div>"
+            f"<small>{now_iso()}</small></div>"
+            + "".join(sections)
+            + "</div></body></html>"
+        )
+        path = os.path.join(
+            REPORTS_PATH,
+            f"search_{safe_query}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(report)
+        return path
 
-        safe_query = "".join(c for c in query if c.isalnum() or c in "_- ")[:50] or "search"
-        f = os.path.join(REPORTS_PATH, f"search_{safe_query}_{datetime.now().strftime('%Y%m%d_%H%M')}.html")
-        with open(f, 'w', encoding='utf-8') as fp:
-            fp.write(html)
-
-        size_kb = os.path.getsize(f) / 1024
-        print(f"📄 تقرير البحث: {f} ({size_kb:.1f} KB)")
-        TelegramSender.send_document(f, f"🔍 تقرير بحث: {query}\n📦 الحجم: {size_kb:.1f} KB")
-        return f
 
 # ============================================================
-# 9. أداة السكراب — instaharvest-v2 Public API
+# 11. Main scraper
 # ============================================================
 class InstagramSearcher:
     def __init__(self):
         self.ig = InstagramClient.get_client()
         if self.ig is None:
-            raise RuntimeError("فشل الحصول على عميل انستغرام")
+            raise RuntimeError("فشل الحصول على عميل Instagram.")
         self.universal_searcher = UniversalSearcher(self.ig)
 
+    @staticmethod
+    def _profile_username(username):
+        return str(username or "").strip().lstrip("@").lower()
+
+    def _call(self, root, dotted, *args, **kwargs):
+        current = root
+        for part in dotted.split("."):
+            if not hasattr(current, part):
+                return None
+            current = getattr(current, part)
+        try:
+            return current(*args, **kwargs)
+        except TypeError:
+            try:
+                return current(*args)
+            except Exception:
+                return None
+        except Exception:
+            raise
+
     def _get_user_id(self, username):
-        username = str(username or "").lower().strip().lstrip("@")
+        username = self._profile_username(username)
         if not username:
             return None
         if username in InstagramClient._user_id_cache:
             return InstagramClient._user_id_cache[username]
         try:
-            # المسار المجهول المعروف أنه يعمل: public.get_profile.
+            # CRITICAL: Anonymous uses the known-good public method.
             user = self.ig.public.get_profile(username)
-            uid = str(_extract(user, 'pk', 'id', default=''))
+            uid = str(extract(user, "pk", "id", default="") or "")
             if uid:
                 InstagramClient._user_id_cache[username] = uid
                 InstagramClient._save_user_cache()
-                return uid
-        except Exception as e:
-            print(f"      ⚠️ user_id lookup: {type(e).__name__}: {str(e)[:180]}")
-        return None
+            return uid or None
+        except Exception as exc:
+            print(f"⚠️ get_user_id @{username}: {redact_error(exc)}")
+            return None
+
+    def get_profile_info(self, username):
+        username = self._profile_username(username)
+        if not username:
+            return None
+        if not InstagramClient.refresh_if_needed():
+            raise RuntimeError("عميل Instagram غير جاهز.")
+
+        print(f"📊 معلومات الحساب: @{username}")
+        try:
+            if InstagramClient._mode == "login" and hasattr(self.ig, "users"):
+                user = self.ig.users.get_full_profile(username)
+            else:
+                # CRITICAL Anonymous core path.
+                user = self.ig.public.get_profile(username)
+
+            if not user:
+                raise RuntimeError(f"الحساب @{username} غير موجود أو تعذر جلبه.")
+
+            uid = str(extract(user, "pk", "id", default="") or "")
+            if uid:
+                InstagramClient._user_id_cache[username] = uid
+                InstagramClient._save_user_cache()
+
+            info = {
+                "username": str(extract(user, "username", default=username) or username),
+                "full_name": str(extract(user, "full_name", "fullname", default="") or ""),
+                "bio": str(extract(user, "biography", "bio", default="") or ""),
+                "posts_count": int(extract(user, "media_count", "posts_count", default=0) or 0),
+                "followers": int(extract(user, "follower_count", "followers", default=0) or 0),
+                "following": int(extract(user, "following_count", "following", default=0) or 0),
+                "profile_pic": str(extract(
+                    user, "profile_pic_url_hd", "profile_pic_url", default=""
+                ) or ""),
+                "is_private": bool(extract(user, "is_private", default=False)),
+                "is_verified": bool(extract(user, "is_verified", default=False)),
+                "is_business": bool(extract(
+                    user, "is_business", "is_professional_account", default=False
+                )),
+                "category": str(extract(
+                    user, "category", "business_category_name", default=""
+                ) or ""),
+                "external_url": str(extract(user, "external_url", default="") or ""),
+            }
+            save_or_update_account(info)
+
+            uname = html_escape(info["username"])
+            profile_link = f"https://www.instagram.com/{uname}/"
+            status = "🔒 خاص" if info["is_private"] else "🌐 عام"
+            verified = "✅ موثق" if info["is_verified"] else "— غير موثق"
+            account_type = "💼 احترافي" if info["is_business"] else "👤 شخصي"
+
+            html = (
+                f"<b>👤 @{uname}</b>\n"
+                f"<b>{html_escape(info['full_name'] or '—')}</b>\n\n"
+                f"📊 <b>إحصائيات</b>\n"
+                f"• المنشورات: <b>{info['posts_count']:,}</b>\n"
+                f"• المتابعون: <b>{info['followers']:,}</b>\n"
+                f"• يتابع: <b>{info['following']:,}</b>\n"
+                f"• الحالة: <b>{status}</b>\n"
+                f"• التوثيق: <b>{verified}</b>\n"
+                f"• النوع: <b>{account_type}</b>\n"
+                f"• الفئة: <b>{html_escape(info['category'] or '—')}</b>\n\n"
+                f"<blockquote expandable>{html_escape(info['bio'][:1000] or 'لا يوجد')}</blockquote>"
+            )
+            if info["external_url"]:
+                html += f'\n🌐 <a href="{html_escape(info["external_url"])}">الموقع الخارجي</a>'
+            html += f'\n\n<a href="{profile_link}">🔗 فتح الحساب على Instagram</a>'
+
+            folder = os.path.join(MEDIA_PATH, username)
+            os.makedirs(folder, exist_ok=True)
+
+            if info["profile_pic"]:
+                pic_path = os.path.join(folder, "profile_pic.jpg")
+                try:
+                    if not os.path.exists(pic_path) or os.path.getsize(pic_path) == 0:
+                        r = _http_session.get(info["profile_pic"], timeout=30)
+                        if r.status_code == 200:
+                            with open(pic_path, "wb") as fh:
+                                fh.write(r.content)
+                    if os.path.exists(pic_path):
+                        TelegramSender.send_photo(
+                            pic_path,
+                            html,
+                            reply_markup=TelegramSender._post_keyboard(profile_link),
+                        )
+                    else:
+                        TelegramSender.send_rich_message(
+                            html,
+                            reply_markup=TelegramSender._post_keyboard(profile_link),
+                        )
+                except Exception as exc:
+                    print(f"⚠️ profile picture: {redact_error(exc)}")
+                    TelegramSender.send_rich_message(
+                        html,
+                        reply_markup=TelegramSender._post_keyboard(profile_link),
+                    )
+            else:
+                TelegramSender.send_rich_message(
+                    html,
+                    reply_markup=TelegramSender._post_keyboard(profile_link),
+                )
+            return info
+
+        except Exception as exc:
+            print(f"❌ get_profile_info: {redact_error(exc)}")
+            raise
+
+    def _fetch_posts(self, username, max_count=MAX_TRAVERSE_LIMIT):
+        username = self._profile_username(username)
+        print(
+            f"📸 جلب المنشورات الأساسية لـ @{username} "
+            f"(mode={InstagramClient._mode_label()})..."
+        )
+
+        # CRITICAL: preserve the exact known-working public call first.
+        try:
+            posts = self.ig.public.get_posts(username, max_count=max_count)
+            posts = list(posts or [])
+            print(f"📦 public.get_posts → {len(posts)}")
+            if posts:
+                return posts
+        except Exception as exc:
+            print(f"⚠️ public.get_posts: {redact_error(exc)}")
+            if is_rate_limit_error(exc):
+                InstagramClient.mark_throttle(exc)
+                return []
+
+        # Only Login mode gets a private fallback.
+        if InstagramClient._mode == "login":
+            uid = self._get_user_id(username)
+            if uid and hasattr(self.ig, "feed"):
+                try:
+                    posts = self._call(
+                        self.ig.feed, "get_all_posts",
+                        uid, max_posts=max_count, delay=1.0
+                    )
+                    posts = list(posts or [])
+                    print(f"📦 feed.get_all_posts fallback → {len(posts)}")
+                    return posts
+                except Exception as exc:
+                    print(f"⚠️ feed.get_all_posts: {redact_error(exc)}")
+        return []
 
     def _fetch_reels(self, username, max_count=50):
         try:
-            if hasattr(self.ig, 'public') and hasattr(self.ig.public, 'get_reels'):
-                reels = self.ig.public.get_reels(username, max_count=max_count)
-                return list(reels or [])
-        except Exception as e:
-            print(f"   ⚠️ get_reels: {type(e).__name__}: {str(e)[:180]}")
-        return []
-
-    def _process_media(self, media, username, folder, index=1, total=1,
-                       fetch_comments=False, max_comments=20):
-        try:
-            pid = save_post_if_not_exists(username, media, None)
-            if pid is None:
-                print(f"      ⚠️ لا يوجد حساب محفوظ لـ @{username}")
-                return False
-
-            files = self._download_media(media, folder)
-
-            if not files:
-                TelegramSender.send_rich_message(
-                    self._post_caption_html(media, index, total, username) +
-                    "\n\n⚠️ <b>تعذر تنزيل الوسائط</b> — تم الاحتفاظ بالمنشور في DB."
-                )
-                return False
-
-            main_fp = files[0][0]
-            mtype = files[0][1] if len(files) == 1 else 'carousel'
-            thumb_url = str(_extract(media, 'thumbnail_url', 'display_url', default=''))
-
-            update_post_media_type(pid, mtype, main_fp, thumb_url)
-
-            keyboard = TelegramSender._post_keyboard(
-                f"https://www.instagram.com/p/{html_escape(str(_extract(media, 'code', default='')))}/",
-                f"https://www.instagram.com/{html_escape(username)}/"
+            reels = self.ig.public.get_reels(
+                self._profile_username(username),
+                max_count=max_count
             )
+            return list(reels or [])
+        except Exception as exc:
+            print(f"⚠️ get_reels: {redact_error(exc)}")
+            return []
 
-            caption = self._post_caption_html(media, index, total, username)
-            for file_index, (path, kind) in enumerate(files, 1):
-                media_caption = caption
-                if kind == 'video':
-                    ok = TelegramSender.send_video(path, media_caption, reply_markup=keyboard if file_index == 1 else None)
-                else:
-                    ok = TelegramSender.send_photo(path, media_caption, reply_markup=keyboard if file_index == 1 else None)
-                if not ok:
-                    print(f"      ⚠️ تعذر إرسال {os.path.basename(path)}")
-                InstagramClient.human_delay(0.5, 1.2)
-
-            if fetch_comments:
+    def _fetch_comments(self, media, max_comments=20):
+        code = str(extract(media, "code", "shortcode", default="") or "")
+        if code:
+            try:
+                comments = self.ig.public.get_comments(code, max_count=max_comments)
+                return list(comments or [])[:max_comments]
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    InstagramClient.mark_throttle(exc)
+        if InstagramClient._mode == "login":
+            pk = str(extract(media, "pk", "id", default="") or "")
+            if pk and hasattr(self.ig, "media"):
                 try:
-                    code = _extract(media, 'code', 'shortcode', default='')
-                    if code and hasattr(self.ig.public, 'get_comments'):
-                        comments = self.ig.public.get_comments(code, max_count=max_comments)
-                        for c in (comments or []):
-                            save_comment(pid, c)
-                except Exception as ce:
-                    print(f"   ⚠️ تعليقات: {type(ce).__name__}: {str(ce)[:100]}")
-
-            return True
-
-        except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e).lower():
-                InstagramClient._mark_throttle(e)
-                print("🛑 تم إيقاف المعالجة مؤقتاً بسبب 429.")
-                return False
-            print(f"⚠️ معالجة: {type(e).__name__}: {str(e)[:120]}")
-            return False
-
-    def _call(self, obj, dotted, *args, **kwargs):
-        current = obj
-        for part in dotted.split("."):
-            if not hasattr(current, part):
-                return None
-            current = getattr(current, part)
-        return current(*args, **kwargs) if callable(current) else current
+                    comments = self.ig.media.get_comments_parsed(pk)
+                    return list(comments or [])[:max_comments]
+                except Exception as exc:
+                    print(f"⚠️ private comments: {redact_error(exc)}")
+        return []
 
     def _fetch_followers(self, username, max_count=100):
         if InstagramClient._mode != "login":
+            print("ℹ️ Followers تتطلب Login.")
             return []
         uid = self._get_user_id(username)
         if not uid:
@@ -1381,35 +2084,44 @@ class InstagramSearcher:
             users = self._call(self.ig, "friendships.get_all_followers", uid)
             if users is None:
                 users = self._call(self.ig, "graphql.get_followers", uid)
-            return list(users or [])[:max_count]
-        except Exception as e:
-            print(f"   ⚠️ followers: {type(e).__name__}: {str(e)[:160]}")
+            users = list(users or [])
+            print(f"👥 followers → {len(users)}")
+            return users[:max_count]
+        except Exception as exc:
+            print(f"⚠️ followers: {redact_error(exc)}")
             return []
 
     def _fetch_following(self, username, max_count=100):
         if InstagramClient._mode != "login":
+            print("ℹ️ Following تتطلب Login.")
             return []
         uid = self._get_user_id(username)
         if not uid:
             return []
         try:
             users = self._call(self.ig, "friendships.get_all_following", uid)
-            return list(users or [])[:max_count]
-        except Exception as e:
-            print(f"   ⚠️ following: {type(e).__name__}: {str(e)[:160]}")
+            users = list(users or [])
+            print(f"➡️ following → {len(users)}")
+            return users[:max_count]
+        except Exception as exc:
+            print(f"⚠️ following: {redact_error(exc)}")
             return []
 
     def _fetch_stories(self, username, max_count=50):
+        if InstagramClient._mode != "login":
+            print("ℹ️ Stories في الوضع Anonymous غير مفعلة عمداً.")
+            return []
+
         uid = self._get_user_id(username)
         if not uid:
             return []
         try:
             items = self._call(self.ig, "stories.get_user_stories", uid)
-            if items is None and hasattr(self.ig, "public"):
-                items = self._call(self.ig.public, "get_stories", username, max_count=max_count)
-            return list(items or [])[:max_count]
-        except Exception as e:
-            print(f"   ⚠️ stories: {type(e).__name__}: {str(e)[:160]}")
+            items = list(items or [])
+            print(f"📖 stories.get_user_stories → {len(items)}")
+            return items[:max_count]
+        except Exception as exc:
+            print(f"⚠️ Stories: {redact_error(exc)}")
             return []
 
     def _fetch_highlights(self, username, max_count=20):
@@ -1418,276 +2130,1188 @@ class InstagramSearcher:
             return []
         try:
             items = self._call(self.ig, "stories.get_highlights_tray", uid)
-            if items is None:
-                items = self._call(self.ig, "public.get_highlights", username)
-            return list(items or [])[:max_count]
-        except Exception as e:
-            print(f"   ⚠️ highlights: {type(e).__name__}: {str(e)[:160]}")
+            if items is None and hasattr(self.ig, "public"):
+                items = self._call(self.ig.public, "get_highlights", username)
+            items = list(items or [])
+            print(f"📌 highlights → {len(items)}")
+            return items[:max_count]
+        except Exception as exc:
+            print(f"⚠️ Highlights: {redact_error(exc)}")
             return []
 
-    def _fetch_comments(self, media, max_comments=20):
-        code = _extract(media, 'code', 'shortcode', default='')
-        if code and hasattr(self.ig, "public"):
-            try:
-                return list(self.ig.public.get_comments(code, max_count=max_comments) or [])
-            except Exception:
-                pass
-        try:
-            pk = _extract(media, 'pk', 'id', default='')
-            items = self._call(self.ig, "media.get_comments_parsed", pk)
-            return list(items or [])[:max_comments]
-        except Exception:
-            return []
-
-    def _download_url(self, url, filepath):
+    def _download_url(self, url, path, timeout=90):
         if not url:
             return False
         try:
-            r = _http_session.get(str(url), timeout=60, stream=True)
-            if r.status_code != 200:
-                return False
-            with open(filepath, "wb") as f:
-                for chunk in r.iter_content(1024 * 32):
-                    f.write(chunk)
-            return True
-        except Exception:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return True
+
+            headers = {"Referer": "https://www.instagram.com/"}
+            with _http_session.get(
+                str(url), headers=headers, timeout=timeout, stream=True
+            ) as r:
+                if r.status_code != 200:
+                    print(f"      ⚠️ media HTTP {r.status_code}")
+                    return False
+                with open(path, "wb") as fh:
+                    for chunk in r.iter_content(1024 * 64):
+                        if chunk:
+                            fh.write(chunk)
+            return os.path.exists(path) and os.path.getsize(path) > 0
+        except Exception as exc:
+            print(f"      ⚠️ download_url: {redact_error(exc)}")
             return False
 
-    def _normalize_download_result(self, result, folder, name):
-        vals = result if isinstance(result, (list, tuple, set)) else [result]
-        out = []
-        for item in vals:
-            if item is None:
+    def _normalize_native_download(self, result, folder, basename):
+        output = []
+        values = as_list(result)
+        for idx, value in enumerate(values, 1):
+            if value is None:
                 continue
-            path = os.fspath(item) if isinstance(item, os.PathLike) else str(item)
-            if not os.path.exists(path):
+            try:
+                source = os.fspath(value)
+            except TypeError:
+                source = str(value)
+            if not os.path.exists(source):
                 continue
-            ext = os.path.splitext(path)[1] or ".jpg"
-            target = os.path.join(folder, name + ext)
-            if os.path.abspath(path) != os.path.abspath(target):
+
+            ext = os.path.splitext(source)[1].lower() or ".jpg"
+            target_name = f"{basename}" if len(values) == 1 else f"{basename}_{idx:02d}"
+            target = os.path.join(folder, target_name + ext)
+            if os.path.abspath(source) != os.path.abspath(target):
                 try:
-                    shutil.copy2(path, target)
-                    path = target
+                    shutil.copy2(source, target)
+                    source = target
                 except Exception:
                     pass
-            out.append((path, "video" if path.lower().endswith((".mp4",".mov",".webm")) else "image"))
-        return out
+            kind = "video" if ext in (".mp4", ".mov", ".webm") else "image"
+            output.append((source, kind))
+        return output
+
+    def _media_parts(self, media):
+        carousel = extract(
+            media, "carousel_media", "carousel_media_items", default=[]
+        )
+        carousel = as_list(carousel)
+        if len(carousel) > 1:
+            return carousel
+        return [media]
 
     def _download_media(self, media, folder):
         os.makedirs(folder, exist_ok=True)
-        code = str(_extract(media, 'code', 'shortcode', 'pk', 'id', default='media'))
+        code = str(extract(
+            media, "code", "shortcode", "pk", "id", default="media"
+        ) or "media")
 
-        # Anonymous: لا نغيّر مسار التنزيل الذي نجح سابقاً.
-        # Login: جرّب downloader الخاص بالمكتبة أولاً.
+        # Login: use the library downloader first.
         if InstagramClient._mode == "login":
-            pk = _extract(media, 'pk', 'id', default='')
-            if pk:
+            pk = str(extract(media, "pk", "id", default="") or "")
+            if pk and hasattr(self.ig, "download"):
                 try:
-                    got = self._call(self.ig, "download.download_media", pk)
-                    normalized = self._normalize_download_result(got, folder, code)
+                    got = self.ig.download.download_media(pk)
+                    normalized = self._normalize_native_download(
+                        got, folder, safe_name(code)
+                    )
                     if normalized:
                         return normalized
-                except Exception as e:
-                    print(f"      ⚠️ native download: {type(e).__name__}")
+                except Exception as exc:
+                    print(f"      ⚠️ native media download: {redact_error(exc)}")
 
-        video_url = _extract(media, 'video_url', default=None)
-        image_url = _extract(media, 'display_url', 'thumbnail_url', 'image_url', default=None)
-        target_url = video_url or image_url
-        if not target_url:
-            print(f"      ⚠️ لا يوجد URL للوسائط للمنشور {code}")
+        parts = self._media_parts(media)
+        output = []
+        for idx, part in enumerate(parts, 1):
+            video_url = str(extract(part, "video_url", default="") or "")
+            image_url = str(extract(
+                part, "display_url", "thumbnail_url", "image_url", default=""
+            ) or "")
+            url = video_url or image_url
+            if not url:
+                continue
+
+            ext = ".mp4" if video_url else ".jpg"
+            suffix = "" if len(parts) == 1 else f"_{idx:02d}"
+            target = os.path.join(folder, safe_name(code) + suffix + ext)
+            if not self._download_url(url, target):
+                continue
+            output.append((target, "video" if video_url else "image"))
+            print(f"      ✅ نُزّل: {os.path.basename(target)}")
+
+        return output
+
+    def _download_story(self, story, folder, index=1):
+        os.makedirs(folder, exist_ok=True)
+        pk = str(extract(story, "pk", "id", default=f"story_{index}") or f"story_{index}")
+        video_url = str(extract(story, "video_url", default="") or "")
+        image_url = str(extract(
+            story, "display_url", "thumbnail_url", "image_url", "url", default=""
+        ) or "")
+        url = video_url or image_url
+        if not url:
+            return None
+        ext = ".mp4" if video_url else ".jpg"
+        path = os.path.join(folder, f"story_{safe_name(pk)}{ext}")
+        if self._download_url(url, path, timeout=90):
+            return path
+        return None
+
+    def _download_highlight_item(self, item, folder, index=1):
+        os.makedirs(folder, exist_ok=True)
+        pk = str(extract(item, "pk", "id", default=f"item_{index}") or f"item_{index}")
+        video_url = str(extract(item, "video_url", default="") or "")
+        image_url = str(extract(
+            item, "display_url", "thumbnail_url", "image_url", "url", default=""
+        ) or "")
+        url = video_url or image_url
+        if not url:
+            return None
+        ext = ".mp4" if video_url else ".jpg"
+        path = os.path.join(folder, f"item_{safe_name(pk)}{ext}")
+        if self._download_url(url, path, timeout=90):
+            return path
+        return None
+
+    def _fetch_highlight_items(self, highlight):
+        items = extract(highlight, "items", "stories", "media", default=None)
+        if items:
+            return as_list(items)
+
+        pk = str(extract(highlight, "pk", "id", default="") or "")
+        if not pk:
             return []
 
-        ext = 'mp4' if video_url else 'jpg'
-        filepath = os.path.join(folder, f"{code}.{ext}")
-
-        try:
-            r = _http_session.get(str(target_url), timeout=60, stream=True)
-            if r.status_code == 200:
-                with open(filepath, 'wb') as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                kind = 'video' if ext == 'mp4' else 'image'
-                print(f"      ✅ نُزّل: {os.path.basename(filepath)}")
-                return [(filepath, kind)]
-            print(f"      ⚠️ HTTP {r.status_code} للوسائط {code}")
-        except Exception as e:
-            print(f"      ⚠️ download: {type(e).__name__}: {str(e)[:180]}")
+        # Use a method when this particular library build exposes one.
+        for dotted in (
+            "stories.get_highlight_items",
+            "stories.get_highlight",
+            "public.get_highlight",
+        ):
+            try:
+                got = self._call(self.ig, dotted, pk)
+                if got:
+                    if isinstance(got, dict) and "items" in got:
+                        return as_list(got["items"])
+                    return as_list(got)
+            except Exception:
+                pass
         return []
 
-    def scrape(self, username, max_posts=10, scrape_mode='smart_merge', order='desc',
-               fetch_comments=False, max_comments=20, fetch_followers=False, max_followers=100,
-               fetch_stories=False, max_stories=50,
-               fetch_highlights=False, max_highlights=20,
-               fetch_following=False, max_following=100):
-        if not InstagramClient.refresh_if_needed():
-            TelegramSender.send_message("❌ العميل غير جاهز حالياً")
-            return
+    def _post_caption_html(self, media, index, total, username):
+        code = html_escape(str(
+            extract(media, "code", "shortcode", default="") or ""
+        ))
+        url = f"https://www.instagram.com/p/{code}/"
+        date = extract(media, "taken_at", default=None)
+        if hasattr(date, "strftime"):
+            date_text = date.strftime("%Y-%m-%d %H:%M")
+        else:
+            date_text = html_escape(str(date or "غير معروف"))
+        caption = html_escape(str(
+            extract(media, "caption_text", "caption", default="(لا يوجد نص)") or ""
+        )[:800])
+        likes = int(extract(media, "like_count", "likes", default=0) or 0)
+        comments = int(extract(media, "comment_count", "comments", default=0) or 0)
+        views = int(extract(media, "view_count", "views", default=0) or 0)
+        plays = int(extract(media, "play_count", "plays", default=0) or 0)
+        metric = f"👁️ {views:,}" if views else (f"▶️ {plays:,}" if plays else "👁️ —")
+        profile_url = f"https://www.instagram.com/{html_escape(username)}/"
+        return (
+            f"<b>📌 المنشور #{index:02d} / {total:02d}</b> • <code>{code}</code>\n"
+            f"👤 <a href='{profile_url}'>@{html_escape(username)}</a>\n"
+            f"📅 {date_text}\n"
+            f"❤️ {likes:,}   💬 {comments:,}   {metric}\n\n"
+            f"<blockquote>{caption}</blockquote>\n"
+            f"<a href='{url}'>🔗 فتح المنشور على Instagram</a>"
+        )
 
-        username = str(username or "").strip().lstrip("@")
-        successful = 0
-        targets = []
+    def _process_media(self, media, username, folder, index, total,
+                       fetch_comments=False, max_comments=20):
         try:
-            uid = self._get_user_id(username)
-            if not uid:
-                TelegramSender.send_message(f"❌ لم يتم العثور على @{html_escape(username)}")
-                return
+            post_id = save_post_if_not_exists(username, media)
+            if post_id is None:
+                print(f"      ⚠️ لم يتم حفظ الحساب @{username} في DB.")
+                return False
 
-            aid = get_account_id(username)
-            folder = os.path.join(MEDIA_PATH, username)
-            os.makedirs(folder, exist_ok=True)
-
-            # ========================================================
-            # CORE ANONYMOUS/POST PATH — نفس الاستدعاء الذي نجح أصلاً
-            # ========================================================
-            print(f"📸 جلب المنشورات الأساسية لـ @{username}...")
-            all_posts = self._fetch_posts(username, max_count=max_posts * 2)
-            print(f"📦 تم جلب {len(all_posts)} منشور من public.get_posts")
-
-            if order == 'asc':
-                all_posts = sorted(
-                    all_posts,
-                    key=lambda x: _extract(x, 'taken_at', default='') or ''
+            files = self._download_media(media, folder)
+            if not files:
+                update_post_media(
+                    post_id,
+                    str(extract(media, "media_type", "product_type", default="") or ""),
+                    "",
+                    str(extract(media, "thumbnail_url", "display_url", default="") or ""),
                 )
-            else:
-                all_posts = sorted(
-                    all_posts,
-                    key=lambda x: _extract(x, 'taken_at', default='') or '',
-                    reverse=True
+                TelegramSender.send_rich_message(
+                    self._post_caption_html(media, index, total, username)
+                    + "\n\n⚠️ <b>تعذر تنزيل الوسائط</b> — بقيت بيانات المنشور في DB."
                 )
+                return False
 
-            seen, unique = set(), []
-            for media in all_posts:
-                key = _extract(media, 'pk', 'id', 'code', 'shortcode', default='')
-                key = str(key)
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                unique.append(media)
-            targets = unique[:max_posts]
-            print(f"🎯 سيتم معالجة {len(targets)} منشور")
+            first_path = files[0][0]
+            media_type = files[0][1] if len(files) == 1 else "carousel"
+            update_post_media(
+                post_id,
+                media_type,
+                first_path,
+                str(extract(media, "thumbnail_url", "display_url", default="") or ""),
+            )
 
-            if not targets:
-                TelegramSender.send_message(
-                    f"ℹ️ لم تُرجع public.get_posts أي منشورات لـ @{html_escape(username)} "
-                    f"(وضع {InstagramClient._mode_label()})."
+            code = str(extract(media, "code", "shortcode", default="") or "")
+            keyboard = TelegramSender._post_keyboard(
+                f"https://www.instagram.com/p/{code}/",
+                f"https://www.instagram.com/{html_escape(username)}/",
+            )
+            caption = self._post_caption_html(media, index, total, username)
+
+            sent_any = False
+            for file_index, (path, kind) in enumerate(files, 1):
+                media_caption = caption if file_index == 1 else (
+                    f"<b>📌 جزء {file_index}/{len(files)}</b>\n"
+                    f"<a href='https://www.instagram.com/p/{code}/'>فتح المنشور</a>"
                 )
-
-            for i, media in enumerate(targets, 1):
-                print(f"📄 [{i}/{len(targets)}] {_extract(media,'code','shortcode','pk',default='?')}")
-                if self._process_media(
-                    media, username, folder, i, len(targets),
-                    fetch_comments=fetch_comments, max_comments=max_comments
-                ):
-                    successful += 1
-                InstagramClient.human_delay()
-
-            # Reels تبقى طبقة مستقلة ولا تؤثر على المنشورات.
-            if fetch_highlights:
-                print("📌 جلب Highlights...")
-                highlights = self._fetch_highlights(username, max_highlights)
-                hf = os.path.join(HIGHLIGHTS_PATH, username)
-                os.makedirs(hf, exist_ok=True)
-                total_hi = 0
-                for hi, highlight in enumerate(highlights, 1):
-                    title = str(_extract(highlight,'title','name',default=f'Highlight {hi}'))
-                    items = _extract(highlight,'items','stories',default=[]) or []
-                    highlight_id = save_highlight_record(aid, highlight)
-                    TelegramSender.send_rich_message(
-                        f"<b>📌 Highlight #{hi}</b> — {html_escape(title)}
-"
-                        f"👤 @{html_escape(username)}
-📦 {len(items)} عنصر"
+                ok = (
+                    TelegramSender.send_video(
+                        path, media_caption,
+                        reply_markup=keyboard if file_index == 1 else None
                     )
-                    for i,item in enumerate(list(items),1):
-                        fp = self._download_highlight_item(item,hf,i)
-                        if not fp: continue
-                        total_hi += 1
-                        save_highlight_item_record(highlight_id, item, fp)
-                        if fp.lower().endswith(('.mp4','.mov','.webm')):
-                            TelegramSender.send_video(fp,f"<b>📌 {html_escape(title)}</b> — {i}")
-                        else:
-                            TelegramSender.send_photo(fp,f"<b>📌 {html_escape(title)}</b> — {i}")
-                print(f"📌 Highlights: {total_hi}")
-
-            if fetch_followers:
-                followers = self._fetch_followers(username, max_followers)
-                for user in followers:
-                    save_follower(aid, user)
-                if followers:
-                    TelegramSender.send_follower_list(username, followers)
-                else:
-                    TelegramSender.send_message("ℹ️ قائمة المتابعين غير متاحة في الوضع الحالي.")
-
-            if fetch_following:
-                following = self._fetch_following(username, max_following)
-                for user in following:
-                    save_following(aid, user)
-                if following:
-                    lines = [
-                        f"<b>{i:03d}.</b> @{html_escape(str(_extract(u,'username',default='')))} — "
-                        f"{html_escape(str(_extract(u,'full_name','fullname',default='—')))}"
-                        for i,u in enumerate(following,1)
-                    ]
-                    for start in range(0, len(lines), 20):
-                        TelegramSender.send_message_html(
-                            f"<b>➡️ Following — @{html_escape(username)}</b>
-"
-                            f"📦 {start+1}–{min(start+20,len(lines))} من {len(lines)}
-
-" +
-                            "
-".join(lines[start:start+20])
-                        )
-
-            if fetch_stories:
-                print("📖 جلب Stories...")
-                stories = self._fetch_stories(username, max_stories)
-                sf = os.path.join(STORIES_PATH, username)
-                os.makedirs(sf, exist_ok=True)
-                story_ok = 0
-                for i, story in enumerate(stories,1):
-                    fp = self._download_story(story,sf,i)
-                    if not fp: continue
-                    story_ok += 1
-                    save_story(
-                        aid, story, fp,
-                        str(_extract(story,'video_url','display_url','url',default=''))
+                    if kind == "video"
+                    else TelegramSender.send_photo(
+                        path, media_caption,
+                        reply_markup=keyboard if file_index == 1 else None
                     )
-                    cap = (
-                        f"<b>📖 Story #{i:02d}/{len(stories):02d}</b>
-"
-                        f"👤 @{html_escape(username)}
-"
-                        f"🔐 {InstagramClient._mode_label()}"
-                    )
-                    if fp.lower().endswith(('.mp4','.mov','.webm')):
-                        TelegramSender.send_video(fp,cap)
-                    else:
-                        TelegramSender.send_photo(fp,cap)
-                print(f"📖 Stories: {story_ok}/{len(stories)}")
+                )
+                sent_any = sent_any or ok
+                if not ok:
+                    print(f"      ⚠️ Telegram لم يرسل {os.path.basename(path)}")
+                InstagramClient.human_delay(0.3, 0.8)
 
-            csv_p = self._csv_report(username)
-            html_p = self._html_report(username, order)
-            if csv_p: TelegramSender.send_document(csv_p, f"📊 CSV @{username}")
-            if html_p: TelegramSender.send_document(html_p, f"📄 HTML @{username}")
+            if fetch_comments and not InstagramClient.is_throttled():
+                comments = self._fetch_comments(media, max_comments)
+                for comment in comments:
+                    save_comment(post_id, comment)
 
-            TelegramSender.send_rich_message(
-                f"<b>✅ انتهت المهمة</b>
-"
-                f"👤 @{html_escape(username)}
-"
-                f"📦 المنشورات: <b>{len(targets)}</b>
-"
-                f"✅ نُزّل بنجاح: <b>{successful}</b>
-"
+            return sent_any
+
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                InstagramClient.mark_throttle(exc)
+                print("🛑 توقف آمن بسبب 429.")
+                return False
+            print(f"⚠️ process_media: {redact_error(exc)}")
+            return False
+
+    def _scrape_followers(self, username, account_id, max_followers):
+        followers = self._fetch_followers(username, max_followers)
+        for user in followers:
+            save_follower(account_id, user)
+        if followers:
+            TelegramSender.send_follower_list(username, followers, "👥 Followers")
+        else:
+            TelegramSender.send_message_html(
+                f"<b>ℹ️ Followers</b>\n@{html_escape(username)}\nغير متاحة في الوضع الحالي."
+            )
+        return len(followers)
+
+    def _scrape_following(self, username, account_id, max_following):
+        following = self._fetch_following(username, max_following)
+        for user in following:
+            save_following(account_id, user)
+        if following:
+            lines = []
+            for idx, user in enumerate(following, 1):
+                uname = html_escape(str(extract(user, "username", default="") or ""))
+                fullname = html_escape(str(extract(user, "full_name", "fullname", default="—") or "—"))
+                lines.append(f"<b>{idx:03d}.</b> @{uname} — {fullname}")
+            for start in range(0, len(lines), 20):
+                TelegramSender.send_message_html(
+                    f"<b>➡️ Following — @{html_escape(username)}</b>\n"
+                    f"📦 {start + 1}–{min(start + 20, len(lines))} من {len(lines)}\n\n"
+                    + "\n".join(lines[start:start + 20])
+                )
+        else:
+            TelegramSender.send_message_html(
+                f"<b>ℹ️ Following</b>\n@{html_escape(username)}\nغير متاحة في الوضع الحالي."
+            )
+        return len(following)
+
+    def _scrape_stories(self, username, account_id, max_stories):
+        stories = self._fetch_stories(username, max_stories)
+        folder = os.path.join(STORIES_PATH, username)
+        ok = 0
+        for idx, story in enumerate(stories, 1):
+            path = self._download_story(story, folder, idx)
+            if not path:
+                continue
+            ok += 1
+            save_story(
+                account_id,
+                story,
+                path,
+                str(extract(story, "video_url", "url", "display_url", default="") or ""),
+                str(extract(story, "thumbnail_url", "display_url", default="") or ""),
+            )
+            caption = (
+                f"<b>📖 Story #{idx:02d}/{len(stories):02d}</b>\n"
+                f"👤 @{html_escape(username)}\n"
                 f"🔐 {InstagramClient._mode_label()}"
             )
-        except Exception as e:
-            InstagramClient._record_error(e)
-            print(f"❌ scrape: {type(e).__name__}: {str(e)[:350]}")
-            traceback.print_exc()
-            TelegramSender.send_message(
-                f"❌ {type(e).__name__}: {html_escape(str(e)[:600])}"
+            if path.lower().endswith((".mp4", ".mov", ".webm")):
+                TelegramSender.send_video(path, caption)
+            else:
+                TelegramSender.send_photo(path, caption)
+        print(f"📖 Stories: {ok}/{len(stories)}")
+        return ok
+
+    def _scrape_highlights(self, username, account_id, max_highlights):
+        highlights = self._fetch_highlights(username, max_highlights)
+        if not highlights:
+            TelegramSender.send_message_html(
+                f"<b>ℹ️ Highlights</b>\n@{html_escape(username)}\nلم تُرجع المنصة Highlights."
+            )
+            return 0
+
+        folder = os.path.join(HIGHLIGHTS_PATH, username)
+        total_items = 0
+
+        for idx, highlight in enumerate(highlights, 1):
+            title = str(extract(
+                highlight, "title", "name", default=f"Highlight {idx}"
+            ) or f"Highlight {idx}")
+            cover_path = ""
+            cover_url = str(extract(
+                highlight, "cover_url", "thumbnail_url", default=""
+            ) or "")
+            if cover_url:
+                cover_path = os.path.join(
+                    folder,
+                    f"cover_{idx:02d}.jpg"
+                )
+                if not self._download_url(cover_url, cover_path):
+                    cover_path = ""
+
+            highlight_id = save_highlight_record(account_id, highlight, cover_path)
+            items = self._fetch_highlight_items(highlight)
+            if highlight_id is None:
+                continue
+
+            TelegramSender.send_message_html(
+                f"<b>📌 Highlight #{idx}</b> — {html_escape(title)}\n"
+                f"👤 @{html_escape(username)}\n"
+                f"📦 العناصر المعروفة: {len(items)}"
             )
 
+            for item_index, item in enumerate(items, 1):
+                path = self._download_highlight_item(item, folder, item_index)
+                if not path:
+                    continue
+                total_items += 1
+                save_highlight_item(highlight_id, item, path)
+                caption = f"<b>📌 {html_escape(title)}</b> — {item_index}"
+                if path.lower().endswith((".mp4", ".mov", ".webm")):
+                    TelegramSender.send_video(path, caption)
+                else:
+                    TelegramSender.send_photo(path, caption)
 
+        print(f"📌 Highlights downloaded items: {total_items}")
+        return total_items
+
+    def scrape(self, username, max_posts=10, scrape_mode="smart_merge",
+               order="desc", fetch_comments=False, max_comments=20,
+               fetch_followers=False, max_followers=100,
+               fetch_stories=False, max_stories=50,
+               fetch_highlights=False, max_highlights=20,
+               fetch_following=False, max_following=100,
+               fetch_reels=False, max_reels=20):
+        username = self._profile_username(username)
+        if not username:
+            raise ValueError("اسم المستخدم مطلوب.")
+        if not InstagramClient.refresh_if_needed():
+            raise RuntimeError(
+                f"عميل Instagram غير جاهز؛ status={InstagramClient._status}"
+            )
+
+        print("=" * 70)
+        print(f"🚀 SCRAPE @{username} | mode={InstagramClient._mode_label()}")
+        print("=" * 70)
+
+        set_job_state("running", username, "scrape", "بدء السكراب")
+
+        profile = self.get_profile_info(username)
+        if not profile:
+            raise RuntimeError(f"تعذر الحصول على بروفايل @{username}")
+
+        account_id = get_account_id(username)
+        if not account_id:
+            raise RuntimeError("لم يتم إنشاء سجل الحساب في DB.")
+
+        folder = os.path.join(MEDIA_PATH, username)
+        os.makedirs(folder, exist_ok=True)
+
+        max_posts = safe_int(max_posts, 10, 1, 500)
+        all_posts = self._fetch_posts(username, max_posts * 2)
+        if InstagramClient.is_throttled():
+            TelegramSender.send_message_html(
+                f"<b>🛑 توقف آمن</b>\n429 من Instagram أثناء جلب منشورات @{html_escape(username)}"
+            )
+            return
+
+        key_sort = lambda x: str(extract(x, "taken_at", default="") or "")
+        all_posts = sorted(all_posts, key=key_sort, reverse=(order != "asc"))
+        targets = dedupe_items(all_posts)[:max_posts]
+
+        print(f"📦 all_posts={len(all_posts)} | unique targets={len(targets)}")
+
+        if not targets:
+            TelegramSender.send_message_html(
+                f"<b>ℹ️ لم تُرجع public.get_posts أي منشورات</b>\n"
+                f"👤 @{html_escape(username)}\n"
+                f"🔐 {InstagramClient._mode_label()}"
+            )
+        else:
+            TelegramSender.send_rich_message(
+                f"<b>📦 Instagram OSINT</b>\n"
+                f"<b>👤 @{html_escape(username)}</b>\n"
+                f"📌 <b>{len(targets)}</b> منشور للتنزيل\n"
+                f"📅 {'الأحدث أولاً' if order == 'desc' else 'الأقدم أولاً'}",
+                TelegramSender._post_keyboard(
+                    f"https://www.instagram.com/{html_escape(username)}/"
+                ),
+            )
+
+        successful = 0
+        for idx, media in enumerate(targets, 1):
+            if InstagramClient.is_throttled():
+                print(f"🛑 توقف: 429 بعد {successful}/{len(targets)}")
+                break
+            code = str(extract(media, "code", "shortcode", "pk", default="?") or "?")
+            print(f"📄 [{idx}/{len(targets)}] {code}")
+            if self._process_media(
+                media, username, folder, idx, len(targets),
+                fetch_comments=fetch_comments, max_comments=max_comments
+            ):
+                successful += 1
+            InstagramClient.human_delay()
+
+        # Optional independent collectors.
+        reels_count = 0
+        if fetch_reels and not InstagramClient.is_throttled():
+            reels = self._fetch_reels(username, max_reels)
+            reels_count = len(reels)
+            print(f"🎬 Reels: {reels_count}")
+
+        followers_count = 0
+        following_count = 0
+        stories_count = 0
+        highlight_items_count = 0
+
+        if fetch_followers and not InstagramClient.is_throttled():
+            followers_count = self._scrape_followers(
+                username, account_id, safe_int(max_followers, 100, 1, 5000)
+            )
+
+        if fetch_following and not InstagramClient.is_throttled():
+            following_count = self._scrape_following(
+                username, account_id, safe_int(max_following, 100, 1, 5000)
+            )
+
+        if fetch_stories and not InstagramClient.is_throttled():
+            stories_count = self._scrape_stories(
+                username, account_id, safe_int(max_stories, 50, 1, 200)
+            )
+
+        if fetch_highlights and not InstagramClient.is_throttled():
+            highlight_items_count = self._scrape_highlights(
+                username, account_id, safe_int(max_highlights, 20, 1, 100)
+            )
+
+        csv_path = self._csv_report(username)
+        html_path = self._html_report(username, order)
+
+        if csv_path:
+            TelegramSender.send_document(csv_path, f"📊 CSV @{username}")
+        if html_path:
+            TelegramSender.send_document(html_path, f"📄 HTML @{username}")
+
+        summary = (
+            f"<b>✅ انتهت المهمة</b>\n"
+            f"👤 @{html_escape(username)}\n"
+            f"📌 المنشورات: <b>{len(targets)}</b>\n"
+            f"✅ نُفّذ بنجاح: <b>{successful}</b>\n"
+            f"🎬 Reels: <b>{reels_count}</b>\n"
+            f"👥 Followers: <b>{followers_count}</b>\n"
+            f"➡️ Following: <b>{following_count}</b>\n"
+            f"📖 Stories: <b>{stories_count}</b>\n"
+            f"📌 Highlight items: <b>{highlight_items_count}</b>\n"
+            f"🔐 {InstagramClient._mode_label()}"
+        )
+        TelegramSender.send_rich_message(summary)
+        set_job_state("done", username, "scrape", "انتهت المهمة")
+        print("=" * 70)
+
+    def _csv_report(self, username):
+        try:
+            aid = get_account_id(username)
+            if not aid:
+                return None
+            conn = db_connect()
+            conn.row_factory = sqlite3.Row
+            posts = conn.execute(
+                "SELECT * FROM posts WHERE account_id=? ORDER BY taken_at DESC",
+                (aid,),
+            ).fetchall()
+            followers = conn.execute(
+                "SELECT username, full_name FROM followers WHERE account_id=?",
+                (aid,),
+            ).fetchall()
+            following = conn.execute(
+                "SELECT username, full_name FROM following WHERE account_id=?",
+                (aid,),
+            ).fetchall()
+            stories = conn.execute(
+                "SELECT * FROM stories WHERE account_id=? ORDER BY taken_at DESC",
+                (aid,),
+            ).fetchall()
+            conn.close()
+
+            path = os.path.join(
+                REPORTS_PATH,
+                f"{safe_name(username)}_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow([
+                    "type", "code_or_pk", "url", "media_type",
+                    "likes", "comments", "views", "plays", "taken_at",
+                    "username", "full_name", "caption", "file_path"
+                ])
+                for row in posts:
+                    writer.writerow([
+                        "post", row["post_code"], row["post_url"], row["media_type"],
+                        row["like_count"], row["comment_count"], row["view_count"],
+                        row["play_count"], row["taken_at"], username, "",
+                        (row["caption"] or "")[:1000], row["file_path"] or ""
+                    ])
+                for row in followers:
+                    writer.writerow([
+                        "follower", "", "", "", "", "", "", "", "",
+                        row["username"], row["full_name"], "", ""
+                    ])
+                for row in following:
+                    writer.writerow([
+                        "following", "", "", "", "", "", "", "", "",
+                        row["username"], row["full_name"], "", ""
+                    ])
+                for row in stories:
+                    writer.writerow([
+                        "story", row["story_pk"], row["story_url"], row["media_type"],
+                        "", "", "", "", row["taken_at"],
+                        username, "", "", row["file_path"] or ""
+                    ])
+            print(f"📄 CSV: {path}")
+            return path
+        except Exception as exc:
+            print(f"⚠️ CSV report: {redact_error(exc)}")
+            return None
+
+    def _html_report(self, username, order="desc"):
+        try:
+            aid = get_account_id(username)
+            if not aid:
+                return None
+            account = get_account_info(username) or {}
+            posts = get_posts_with_comments(aid, order=order)
+            followers = get_followers(aid)
+            following = get_following(aid)
+            stories = get_stories(aid)
+            highlights = get_highlights(aid)
+
+            profile_pic = ""
+            candidate = os.path.join(MEDIA_PATH, username, "profile_pic.jpg")
+            if os.path.exists(candidate):
+                profile_pic = ThumbnailEngine.from_file(candidate, 150, 50) or ""
+
+            cards = []
+            for post in posts:
+                thumb = ThumbnailEngine.from_file(
+                    post.get("file_path", ""), THUMB_MAX_SIZE, THUMB_QUALITY
+                ) if post.get("file_path") else None
+                if not thumb:
+                    thumb = ThumbnailEngine.from_url(
+                        post.get("thumbnail_url", ""), THUMB_MAX_SIZE,
+                        THUMB_QUALITY, f"report_{post.get('post_code','')}"
+                    )
+                if not thumb:
+                    thumb = ThumbnailEngine.placeholder_svg("📷")
+
+                comment_html = ""
+                if post.get("comments"):
+                    rows = []
+                    for c in post["comments"][:30]:
+                        rows.append(
+                            f"<li>@{html_escape(str(c.get('commenter_username','') or ''))}: "
+                            f"{html_escape(str(c.get('comment_text','') or '')[:300])}</li>"
+                        )
+                    comment_html = "<details><summary>💬 التعليقات</summary><ul>" + "".join(rows) + "</ul></details>"
+
+                cards.append(
+                    f"<article class='post'>"
+                    f"<img src='data:image/jpeg;base64,{thumb}'>"
+                    f"<div><b>{html_escape(str(post.get('media_type','') or ''))}</b> "
+                    f"❤️ {int(post.get('like_count',0) or 0):,} "
+                    f"💬 {int(post.get('comment_count',0) or 0):,} "
+                    f"👁️ {int(post.get('view_count',0) or 0):,}</div>"
+                    f"<p>{html_escape(str(post.get('caption','') or '')[:800])}</p>"
+                    f"<a target='_blank' href='{html_escape(str(post.get('post_url','')))}'>🔗 فتح المنشور</a>"
+                    f"{comment_html}</article>"
+                )
+
+            follower_html = "".join(
+                f"<span>@{html_escape(str(x.get('username','') or ''))}</span>"
+                for x in followers
+            ) or "<em>لا توجد بيانات</em>"
+
+            following_html = "".join(
+                f"<span>@{html_escape(str(x.get('username','') or ''))}</span>"
+                for x in following
+            ) or "<em>لا توجد بيانات</em>"
+
+            story_html = "".join(
+                f"<div><span>📖 {html_escape(str(x.get('story_pk','')))}</span>"
+                f"<small>{html_escape(str(x.get('taken_at','')))}</small></div>"
+                for x in stories
+            ) or "<em>لا توجد Stories محفوظة</em>"
+
+            highlight_html = ""
+            for h in highlights:
+                title = html_escape(str(h.get("title", "") or ""))
+                highlight_html += (
+                    f"<div class='highlight'><b>📌 {title}</b> "
+                    f"<span>({len(h.get('items', []))} عناصر محفوظة / "
+                    f"{int(h.get('media_count',0) or 0)} إجمالاً)</span></div>"
+                )
+            highlight_html = highlight_html or "<em>لا توجد Highlights محفوظة</em>"
+
+            pic_html = (
+                f"<img class='profile' src='data:image/jpeg;base64,{profile_pic}'>"
+                if profile_pic else "<div class='profile placeholder'>👤</div>"
+            )
+
+            css = """
+*{box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:linear-gradient(135deg,#1a1a2e,#0f3460);
+color:#e9edf2;padding:16px;line-height:1.6}
+.container{max-width:1150px;margin:auto}
+.header,.section,.post{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
+border-radius:16px;padding:18px;margin-bottom:16px}
+.header{text-align:center;background:linear-gradient(135deg,#e94560,#c73659)}
+.profile{width:140px;height:140px;border-radius:50%;object-fit:cover}
+.placeholder{display:inline-flex;align-items:center;justify-content:center;background:#24263b}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:12px}
+.stats div{background:rgba(0,0,0,.22);padding:9px;border-radius:9px;text-align:center}
+.post{display:flex;gap:14px}
+.post>img{width:150px;height:150px;object-fit:cover;border-radius:10px;flex:none}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.grid span{background:rgba(0,0,0,.22);padding:8px;border-radius:8px;overflow-wrap:anywhere}
+a{color:#7cc7ff}
+@media(max-width:600px){.post{flex-direction:column}.post>img{width:100%;height:auto}}
+"""
+            safe_user = html_escape(username)
+            html = (
+                "<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'>"
+                f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                f"<title>OSINT — @{safe_user}</title><style>{css}</style></head>"
+                "<body><div class='container'>"
+                f"<header class='header'><h1>🕵️ Instagram OSINT</h1>"
+                f"{pic_html}<h2>@{safe_user}</h2>"
+                f"<div>{html_escape(str(account.get('full_name','') or ''))}</div>"
+                "<div class='stats'>"
+                f"<div>📸 {int(account.get('posts_count',0) or 0):,}</div>"
+                f"<div>👥 {int(account.get('followers',0) or 0):,}</div>"
+                f"<div>➡️ {int(account.get('following',0) or 0):,}</div>"
+                f"<div>{'🔒' if account.get('is_private') else '🌐'}</div>"
+                "</div>"
+                f"<p>{html_escape(str(account.get('bio','') or '')[:1000])}</p></header>"
+                f"<section class='section'><h2>📸 المنشورات ({len(posts)})</h2>"
+                f"{''.join(cards) or '<em>لا توجد منشورات محفوظة</em>'}</section>"
+                f"<section class='section'><h2>👥 Followers ({len(followers)})</h2>"
+                f"<div class='grid'>{follower_html}</div></section>"
+                f"<section class='section'><h2>➡️ Following ({len(following)})</h2>"
+                f"<div class='grid'>{following_html}</div></section>"
+                f"<section class='section'><h2>📖 Stories ({len(stories)})</h2>"
+                f"{story_html}</section>"
+                f"<section class='section'><h2>📌 Highlights ({len(highlights)})</h2>"
+                f"{highlight_html}</section>"
+                "<footer style='opacity:.65;text-align:center'>"
+                f"Generated {html_escape(now_iso())} · instaharvest-v2 {html_escape(INSTAHARVEST_VERSION)}"
+                "</footer></div></body></html>"
+            )
+            path = os.path.join(
+                REPORTS_PATH,
+                f"{safe_name(username)}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            )
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            print(f"📄 HTML report: {path}")
+            return path
+        except Exception as exc:
+            print(f"⚠️ HTML report: {redact_error(exc)}")
+            traceback.print_exc()
+            return None
+
+
+# ============================================================
+# 12. Flask control panel
+# ============================================================
+app = Flask(__name__)
+
+
+def api_status(message=None):
+    status = InstagramClient.get_status()
+    if message:
+        status["message"] = message
+    status["job"] = get_job_state()
+    return status
+
+
+HTML_PAGE = r"""<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instagram OSINT ULTRA v4</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:18px;font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;
+background:linear-gradient(135deg,#101523,#0c2745);color:#111}
+.card{max-width:760px;margin:auto;background:#fff;border-radius:20px;padding:22px;
+box-shadow:0 20px 70px rgba(0,0,0,.35)}
+h1{text-align:center;margin:0 0 6px;color:#0f3460}
+.sub{text-align:center;color:#667085;margin-bottom:18px}
+.section{border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin:12px 0}
+.title{font-weight:800;color:#0f3460;margin-bottom:10px}
+.row{display:flex;gap:9px;align-items:center}
+.row>*{flex:1}
+input[type=text],input[type=number],textarea,button{
+width:100%;padding:11px;border-radius:10px;font:inherit}
+input[type=text],input[type=number],textarea{border:2px solid #e5e7eb}
+textarea{min-height:90px;resize:vertical}
+button{border:0;background:#e94560;color:#fff;font-weight:800;cursor:pointer}
+button.secondary{background:#0f9d76}
+button.gray{background:#64748b}
+button:disabled{opacity:.55;cursor:not-allowed}
+.opt{display:flex;gap:9px;align-items:center;padding:9px;background:#f8fafc;border-radius:9px;margin:5px 0}
+.opt input{width:18px;height:18px}
+.mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.mode-box{padding:12px;border:2px solid #e5e7eb;border-radius:12px;text-align:center;cursor:pointer}
+.mode-box.active{border-color:#e94560;background:#fff4f6}
+.mode-box input{display:none}
+.badge{padding:10px;border-radius:10px;background:#eef2ff;margin-top:10px;text-align:center}
+.badge.ok{background:#dcfce7;color:#166534}
+.badge.err{background:#fee2e2;color:#991b1b}
+.badge.wait{background:#fef3c7;color:#92400e}
+.small{font-size:.85rem;color:#667085}
+.notice{padding:10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px}
+.tabs{display:flex;gap:8px;margin-bottom:10px}
+.tab{background:#f1f5f9;color:#475569}
+.tab.active{background:#0f3460;color:#fff}
+.panel{display:none}.panel.active{display:block}
+@media(max-width:560px){.row,.mode-grid{grid-template-columns:1fr;display:block}.row>*{margin-bottom:7px}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>🕵️ Instagram OSINT Scraper ULTRA v4</h1>
+<div class="sub">Anonymous ثابت + Login اختياري للميزات الخاصة</div>
+
+<div class="section">
+<div class="title">🔐 وضع التشغيل</div>
+<div class="mode-grid">
+<label class="mode-box" id="anonBox">
+<input type="radio" name="mode" value="anonymous">
+<div>🔓 Anonymous</div><div class="small">المنشورات/الملف العام</div>
+</label>
+<label class="mode-box" id="loginBox">
+<input type="radio" name="mode" value="login">
+<div>🔐 Login</div><div class="small">Stories / Followers / Following</div>
+</label>
+</div>
+<div class="row" style="margin-top:9px">
+<button id="applyMode">تفعيل الوضع المحدد</button>
+<button id="refreshStatus" class="gray">تحديث الحالة</button>
+</div>
+<div id="statusBox" class="badge">جارٍ قراءة الحالة…</div>
+</div>
+
+<div class="tabs">
+<button class="tab active" onclick="showTab('scrape',this)">📊 سكراب</button>
+<button class="tab" onclick="showTab('search',this)">🔍 بحث</button>
+</div>
+
+<div id="scrape" class="panel active">
+<form id="scrapeForm">
+<div class="section">
+<div class="title">📌 الحساب</div>
+<input type="text" name="username" placeholder="اسم المستخدم أو @username" required>
+<div class="row" style="margin-top:7px">
+<input type="number" name="max_posts" value="10" min="1" max="500">
+<select name="order" style="padding:11px;border:2px solid #e5e7eb;border-radius:10px;font:inherit">
+<option value="desc">الأحدث أولاً</option>
+<option value="asc">الأقدم أولاً</option>
+</select>
+</div>
+</div>
+
+<div class="section">
+<div class="title">⚙️ الطبقات</div>
+<div class="opt"><input type="checkbox" name="fetch_reels" value="1">🎬 Reels</div>
+<div class="opt"><input type="checkbox" name="fetch_comments" value="1">💬 Comments</div>
+<div class="opt"><input type="checkbox" name="fetch_stories" value="1">📖 Stories <span class="small">(Login)</span></div>
+<div class="opt"><input type="checkbox" name="fetch_highlights" value="1">📌 Highlights</div>
+<div class="opt"><input type="checkbox" name="fetch_followers" value="1">👥 Followers <span class="small">(Login)</span></div>
+<div class="opt"><input type="checkbox" name="fetch_following" value="1">➡️ Following <span class="small">(Login)</span></div>
+</div>
+
+<div class="section">
+<div class="title">🔢 الحدود</div>
+<div class="row">
+<input type="number" name="max_comments" value="20" min="1" max="200" placeholder="Comments">
+<input type="number" name="max_stories" value="50" min="1" max="200" placeholder="Stories">
+<input type="number" name="max_followers" value="100" min="1" max="5000" placeholder="Followers">
+</div>
+<div class="row">
+<input type="number" name="max_following" value="100" min="1" max="5000" placeholder="Following">
+<input type="number" name="max_highlights" value="20" min="1" max="100" placeholder="Highlights">
+<input type="number" name="max_reels" value="20" min="1" max="100" placeholder="Reels">
+</div>
+</div>
+
+<button type="submit" id="scrapeBtn">🚀 بدء السكراب</button>
+</form>
+</div>
+
+<div id="search" class="panel">
+<form id="searchForm">
+<div class="section">
+<div class="title">🔍 البحث</div>
+<textarea name="query" placeholder="@username أو #hashtag أو رابط Instagram أو كلمة بحث" required></textarea>
+</div>
+<div class="opt"><input type="checkbox" name="hunt_mentions" value="1">🔎 Mention Hunter (طلبات إضافية)</div>
+<div class="opt"><input type="checkbox" name="generate_report" value="1" checked>📄 تقرير HTML</div>
+<button type="submit" id="searchBtn" class="secondary">🔍 تنفيذ البحث</button>
+</form>
+</div>
+
+<div class="notice small" style="margin-top:14px">
+⚠️ لا يوجد polling مستمر للحالة. زر تحديث الحالة يرسل طلبًا واحدًا فقط،
+وتبديل الوضع يُنفّذ بطلب واحد ثم تتوقف الطلبات.
+</div>
+</div>
+
+<script>
+function showTab(id, button){
+  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  if(button) button.classList.add('active');
+}
+
+function selectedMode(){
+  const r=document.querySelector('input[name="mode"]:checked');
+  return r ? r.value : 'anonymous';
+}
+
+function paintMode(mode){
+  document.querySelectorAll('.mode-box').forEach(x=>x.classList.remove('active'));
+  document.getElementById(mode==='login'?'loginBox':'anonBox').classList.add('active');
+}
+
+function renderStatus(data){
+  const box=document.getElementById('statusBox');
+  box.className='badge '+(data.status==='ready'?'ok':(data.status==='error'?'err':'wait'));
+  let text=data.message || (data.status||'');
+  if(data.session_loaded) text += ' · جلسة محفوظة';
+  if(data.throttle_remaining>0) text += ' · تهدئة '+data.throttle_remaining+'s';
+  if(data.job && data.job.state==='running'){
+    text += ' · مهمة: '+(data.job.username||'');
+  }
+  box.textContent=text;
+  if(data.mode) {
+    document.querySelector('input[name="mode"][value="'+data.mode+'"]').checked=true;
+    paintMode(data.mode);
+  }
+}
+
+async function refreshStatus(){
+  try{
+    const r=await fetch('/status?once='+Date.now(),{cache:'no-store'});
+    renderStatus(await r.json());
+  }catch(e){
+    renderStatus({status:'error',message:'تعذر الاتصال بالسيرفر'});
+  }
+}
+
+document.querySelectorAll('input[name="mode"]').forEach(r=>{
+  r.addEventListener('change',()=>paintMode(selectedMode()));
+});
+
+document.getElementById('applyMode').addEventListener('click',async()=>{
+  const btn=document.getElementById('applyMode');
+  btn.disabled=true;
+  btn.textContent='⏳ جارٍ التبديل…';
+  try{
+    const r=await fetch('/mode',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode:selectedMode()})
+    });
+    const data=await r.json();
+    renderStatus(data);
+    if(!r.ok && data.error) alert(data.error);
+  }catch(e){
+    alert('فشل طلب تبديل الوضع');
+  }finally{
+    btn.disabled=false;
+    btn.textContent='تفعيل الوضع المحدد';
+  }
+});
+
+document.getElementById('refreshStatus').addEventListener('click',refreshStatus);
+
+document.getElementById('scrapeForm').addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const btn=document.getElementById('scrapeBtn');
+  btn.disabled=true;
+  btn.textContent='⏳ تم إرسال المهمة…';
+  try{
+    const body=new URLSearchParams(new FormData(e.target));
+    const r=await fetch('/start',{method:'POST',body});
+    const data=await r.json();
+    alert(data.message || data.error || 'تم الإرسال');
+  }catch(err){alert('تعذر إرسال المهمة');}
+  finally{btn.disabled=false;btn.textContent='🚀 بدء السكراب';}
+});
+
+document.getElementById('searchForm').addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const btn=document.getElementById('searchBtn');
+  btn.disabled=true;
+  btn.textContent='⏳ تم إرسال البحث…';
+  try{
+    const body=new URLSearchParams(new FormData(e.target));
+    const r=await fetch('/search',{method:'POST',body});
+    const data=await r.json();
+    alert(data.message || data.error || 'تم إرسال البحث');
+  }catch(err){alert('تعذر إرسال البحث');}
+  finally{btn.disabled=false;btn.textContent='🔍 تنفيذ البحث';}
+});
+
+refreshStatus();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "version": "4.0",
+        "instaharvest": INSTAHARVEST_VERSION,
+        "mode": InstagramClient._mode,
+    })
+
+
+@app.route("/status")
+def status():
+    return jsonify(api_status())
+
+
+@app.route("/mode", methods=["POST"])
+def mode_switch():
+    body = request.get_json(silent=True) or request.form
+    requested = str(body.get("mode", "")).strip().lower()
+    if requested not in ("anonymous", "login"):
+        return jsonify({"error": "mode must be anonymous or login"}), 400
+
+    try:
+        # This is intentionally synchronous: one request, no infinite polling.
+        status_data = InstagramClient.switch_mode(requested)
+        return jsonify({
+            **status_data,
+            "ok": True,
+            "message": f"✅ تم تفعيل {status_data['mode']}",
+        })
+    except Exception as exc:
+        current = InstagramClient.get_status()
+        return jsonify({
+            **current,
+            "ok": False,
+            "error": redact_error(exc),
+            "message": (
+                f"❌ لم يتم تفعيل {requested}. "
+                f"الوضع الحالي ما زال {current['mode']}."
+            ),
+        }), 409
+
+
+@app.route("/start", methods=["POST"])
+def start_scrape():
+    username = str(request.form.get("username", "")).strip()
+    if not username:
+        return jsonify({"ok": False, "error": "اسم المستخدم مطلوب."}), 400
+
+    options = {
+        "max_posts": safe_int(request.form.get("max_posts"), 10, 1, 500),
+        "order": request.form.get("order", "desc"),
+        "fetch_comments": request.form.get("fetch_comments") == "1",
+        "max_comments": safe_int(request.form.get("max_comments"), 20, 1, 200),
+        "fetch_stories": request.form.get("fetch_stories") == "1",
+        "max_stories": safe_int(request.form.get("max_stories"), 50, 1, 200),
+        "fetch_highlights": request.form.get("fetch_highlights") == "1",
+        "max_highlights": safe_int(request.form.get("max_highlights"), 20, 1, 100),
+        "fetch_followers": request.form.get("fetch_followers") == "1",
+        "max_followers": safe_int(request.form.get("max_followers"), 100, 1, 5000),
+        "fetch_following": request.form.get("fetch_following") == "1",
+        "max_following": safe_int(request.form.get("max_following"), 100, 1, 5000),
+        "fetch_reels": request.form.get("fetch_reels") == "1",
+        "max_reels": safe_int(request.form.get("max_reels"), 20, 1, 100),
+    }
+
+    if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+        return jsonify({
+            "ok": False,
+            "error": "هناك مهمة أخرى قيد التنفيذ.",
+            "job": get_job_state(),
+        }), 409
+
+    def worker():
+        set_job_state("starting", username, "scrape", "تهيئة السكراب")
+        try:
+            searcher = InstagramSearcher()
+            searcher.scrape(username, **options)
+        except Exception as exc:
+            set_job_state("error", username, "scrape", redact_error(exc))
+            print(f"❌ scrape worker: {redact_error(exc)}")
+            traceback.print_exc()
+            TelegramSender.send_message_html(
+                f"<b>❌ فشل السكراب</b>\n{html_escape(redact_error(exc))}"
+            )
+        finally:
+            INSTAGRAM_JOB_LOCK.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({
+        "ok": True,
+        "message": f"🚀 بدأت مهمة @{html_escape(username)} — {options['max_posts']} منشور",
+        "mode": InstagramClient._mode,
+    })
+
+
+@app.route("/search", methods=["POST"])
+def start_search():
+    query = str(request.form.get("query", "")).strip()
+    if not query:
+        return jsonify({"ok": False, "error": "الاستعلام مطلوب."}), 400
+
+    max_per_type = safe_int(request.form.get("max_per_type"), 10, 1, 50)
+    hunt_mentions = request.form.get("hunt_mentions") == "1"
+    generate_report = request.form.get("generate_report") == "1"
+
+    if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
+        return jsonify({
+            "ok": False,
+            "error": "هناك مهمة أخرى قيد التنفيذ.",
+        }), 409
+
+    def worker():
+        set_job_state("starting", query, "search", "تهيئة البحث")
+        try:
+            searcher = InstagramSearcher()
+            results = searcher.universal_searcher.search(
+                query, max_per_type, hunt_mentions=hunt_mentions
+            )
+            if generate_report:
+                report = searcher.universal_searcher.generate_search_report(
+                    query, results
+                )
+                if report:
+                    TelegramSender.send_document(
+                        report, f"🔍 تقرير البحث: {query}"
+                    )
+            TelegramSender.send_message_html(
+                f"<b>✅ اكتمل البحث</b>\n"
+                f"📝 {html_escape(query)}\n"
+                f"📊 النتائج: {results['stats']['total']}"
+            )
+            set_job_state("done", query, "search", "اكتمل البحث")
+        except Exception as exc:
+            set_job_state("error", query, "search", redact_error(exc))
+            print(f"❌ search worker: {redact_error(exc)}")
+            traceback.print_exc()
+            TelegramSender.send_message_html(
+                f"<b>❌ فشل البحث</b>\n{html_escape(redact_error(exc))}"
+            )
+        finally:
+            INSTAGRAM_JOB_LOCK.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({
+        "ok": True,
+        "message": f"🔍 بدأ البحث: {html_escape(query)}",
+        "mode": InstagramClient._mode,
+    })
+
+
+# ============================================================
+# 13. Startup
+# ============================================================
+init_db()
+InstagramClient.init_paths()
+InstagramClient._load_user_cache()
+
+print(f"📦 instaharvest-v2: {INSTAHARVEST_VERSION}")
+print("🧩 Features:")
+print("   🔓 Anonymous: profile + posts + reels + public search")
+print("   🔐 Login: saved session + Stories + Followers + Following")
+print("   📌 Highlights + comments + cumulative SQLite + CSV/HTML")
+print("   🔎 Search + optional Mention Hunter")
+print("   🔁 Mode switch: atomic, no automatic fallback after failed Login")
+print("   🌐 Control panel: no continuous /status polling")
+
+if not os.getenv("NGROK_AUTH_TOKEN") and NGROK_AUTH_TOKEN:
+    os.environ["NGROK_AUTH_TOKEN"] = NGROK_AUTH_TOKEN
+
+# First client must be Anonymous by default so the known-good public path
+# does not depend on Instagram password authentication.
+InstagramClient._mode = "anonymous"
+InstagramClient.get_client()
+
+try:
+    ngrok.kill()
+except Exception:
+    pass
+
+if NGROK_AUTH_TOKEN:
+    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+else:
+    print("⚠️ NGROK_AUTH_TOKEN غير موجود؛ pyngrok سيحاول إعداد النفق الحالي.")
+
+PORT = 5000
+try:
+    tunnel = ngrok.connect(PORT, bind_tls=True)
+except TypeError:
+    tunnel = ngrok.connect(PORT)
+
+PUBLIC_URL = getattr(tunnel, "public_url", str(tunnel))
+print("=" * 70)
+print(f"🌐 Control Panel: {PUBLIC_URL}")
+print("=" * 70)
+print("✅ لا يوجد polling مستمر لـ /status.")
+print("✅ تبديل Anonymous/Login يتم في طلب واحد.")
+print("✅ البيانات القديمة في Google Drive لا تُحذف.")
+print("=" * 70)
+
+app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False, use_reloader=False)
