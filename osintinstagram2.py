@@ -1316,15 +1316,10 @@ class InstagramClient:
 
     @classmethod
     def _build_login(cls):
-        if not IG_USERNAME or not IG_PASSWORD:
-            raise RuntimeError(
-                "بيانات Login غير موجودة. ضع IG_USERNAME وIG_PASSWORD "
-                "في متغيرات البيئة داخل Colab قبل طلب Login."
-            )
-
         ig = Instagram()
 
-        # Reuse the session first. It avoids an unnecessary password login.
+        # Reuse the Drive session first. A valid saved session must work
+        # even when username/password are not present in the runtime.
         if cls._session_file and os.path.exists(cls._session_file):
             try:
                 print(f"♻️ محاولة تحميل جلسة: {cls._session_file}")
@@ -1339,6 +1334,12 @@ class InstagramClient:
                 print("⚠️ الجلسة المحفوظة غير صالحة؛ سيتم تسجيل الدخول.")
             except Exception as exc:
                 print(f"⚠️ تعذر استخدام الجلسة المحفوظة: {redact_error(exc)}")
+
+        if not IG_USERNAME or not IG_PASSWORD:
+            raise RuntimeError(
+                "لا توجد جلسة Login صالحة محفوظة، وبيانات IG_USERNAME/IG_PASSWORD "
+                "غير موجودة في بيئة Colab."
+            )
 
         print(f"🔐 محاولة Login للحساب: {IG_USERNAME}")
         result = ig.login(IG_USERNAME, IG_PASSWORD)
@@ -1361,47 +1362,52 @@ class InstagramClient:
         if not INSTAGRAM_JOB_LOCK.acquire(blocking=False):
             raise RuntimeError("لا يمكن تبديل الوضع أثناء تنفيذ مهمة سكراب/بحث.")
 
-        with CLIENT_SWITCH_LOCK:
-            old_ig = cls._ig
-            old_mode = cls._mode
-            old_status = cls._status
-            old_error = cls._last_error
-            old_session_loaded = cls._session_loaded
+        try:
+            with CLIENT_SWITCH_LOCK:
+                old_ig = cls._ig
+                old_mode = cls._mode
+                old_status = cls._status
+                old_session_loaded = cls._session_loaded
 
-            try:
-                cls._status = "switching"
-                cls._last_error = ""
+                try:
+                    cls._status = "switching"
+                    cls._last_error = ""
 
-                if requested_mode == "anonymous":
-                    new_ig = cls._build_anonymous()
-                    new_session_loaded = False
-                else:
-                    new_ig, new_session_loaded = cls._build_login()
+                    if requested_mode == "anonymous":
+                        new_ig = cls._build_anonymous()
+                        new_session_loaded = False
+                    else:
+                        new_ig, new_session_loaded = cls._build_login()
 
-                # Atomic commit: only replace the active client after success.
-                cls._ig = new_ig
-                cls._mode = requested_mode
-                cls._status = "ready"
-                cls._session_loaded = new_session_loaded
-                print(f"✅ تم تفعيل {cls._mode_label()}")
-                return cls.get_status()
+                    # Atomic commit: replace the active client only after
+                    # the requested mode has actually initialized.
+                    cls._ig = new_ig
+                    cls._mode = requested_mode
+                    cls._status = "ready"
+                    cls._session_loaded = new_session_loaded
+                    print(f"✅ تم تفعيل {cls._mode_label()}")
+                    return cls.get_status()
 
-            except Exception as exc:
-                cls._ig = old_ig
-                cls._mode = old_mode
-                cls._status = old_status if old_ig is not None else "error"
-                cls._session_loaded = old_session_loaded
-                cls._last_error = redact_error(exc)
-                if is_rate_limit_error(exc):
-                    cls._last_throttle_at = time.time()
-                if "challenge" in cls._last_error.lower() or "checkpoint" in cls._last_error.lower():
-                    cls._last_challenge_at = time.time()
-                print(
-                    f"❌ فشل تفعيل {requested_mode}; "
-                    f"تم الإبقاء على {cls._mode_label()}: {cls._last_error}"
-                )
-                raise
-            # Lock order is always JOB -> CLIENT to avoid deadlocks.
+                except Exception as exc:
+                    # Never silently fall back to Anonymous. Preserve the
+                    # previously working client so a failed Login is visible.
+                    cls._ig = old_ig
+                    cls._mode = old_mode
+                    cls._status = old_status if old_ig is not None else "error"
+                    cls._session_loaded = old_session_loaded
+                    cls._last_error = redact_error(exc)
+                    if is_rate_limit_error(exc):
+                        cls._last_throttle_at = time.time()
+                    low = cls._last_error.lower()
+                    if "challenge" in low or "checkpoint" in low or "verification" in low:
+                        cls._last_challenge_at = time.time()
+
+                    print(
+                        f"❌ فشل تفعيل {requested_mode}; "
+                        f"الوضع الحالي بقي {cls._mode_label()}: {cls._last_error}"
+                    )
+                    raise
+        finally:
             INSTAGRAM_JOB_LOCK.release()
 
     @classmethod
