@@ -1,9 +1,8 @@
 # ============================================================
-# 🕵️ Instagram OSINT Scraper ULTRA v7.0
-# ✅ instadata (CLI) + SQLite تراكمية + تقارير HTML/CSV
-# ✅ Telegram Rich Messages (Bot API 10.1+) — جداول + Details + RTL
-# ✅ منع تكرار دقيق: لا تُنزّل ما هو موجود في Google Drive
-# ✅ إشعار "محمل مسبقاً" لكل منشور متكرر
+# 🕵️ Instagram OSINT Scraper ULTRA v7.1 (FIXED — Drive Enabled)
+# ✅ instadata + SQLite تراكمية + تقارير HTML/CSV
+# ✅ Telegram Rich Messages (Bot API 10.1+)
+# ✅ منع تكرار دقيق + نسخ الوسائط إلى Google Drive
 # ============================================================
 
 # ============================================================
@@ -15,24 +14,15 @@ IG_PASSWORD = ""
 
 DEFAULT_MODE = "anonymous"
 
-TELEGRAM_TOKEN = ":"
+TELEGRAM_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
 THUMB_MAX_SIZE = 150
 THUMB_QUALITY = 40
 THUMB_OPTIMIZE = True
 
-# مسار قاعدة البيانات على Google Drive (نفس المسار القديم — البيانات محفوظة)
-BASE_PATH = "/content/drive/MyDrive/Instagram_Scraper_DB"
-DB_PATH = os.path.join(BASE_PATH, "instagram_data.db")
-MEDIA_PATH = os.path.join(BASE_PATH, "media")
-REPORTS_PATH = os.path.join(BASE_PATH, "reports")
-STORIES_PATH = os.path.join(BASE_PATH, "stories")
-HIGHLIGHTS_PATH = os.path.join(BASE_PATH, "highlights")
-DB_BACKUP_PATH = os.path.join(BASE_PATH, "db_backups")
-
 # ============================================================
-# 2. الاستيرادات
+# 2. الاستيرادات (قبل أي مسار — لأننا سنركّب Drive)
 # ============================================================
 import os, shutil, json, io, time, random, requests, threading, sqlite3, traceback, csv, re, base64, subprocess, sys, tempfile, glob, secrets
 from datetime import datetime
@@ -47,13 +37,65 @@ except ImportError:
     PIL_AVAILABLE = False
     print("⚠️ PIL غير متوفر")
 
+# ============================================================
+# 3. تركيب Google Drive — إلزامي قبل أي مسار دائم
+# ============================================================
+IN_COLAB = False
+try:
+    from google.colab import drive
+    IN_COLAB = True
+except ImportError:
+    drive = None
+    print("⚠️ لسنا داخل Colab — سيتم استخدام مسار محلي")
+
+if IN_COLAB:
+    if not os.path.exists("/content/drive/MyDrive"):
+        print("📂 تركيب Google Drive...")
+        drive.mount("/content/drive")
+    else:
+        print("✅ Google Drive مركّب مسبقاً")
+else:
+    print("⚠️ خارج Colab: سيتم حفظ البيانات في المجلد المحلي")
+
+# الآن — بعد التركيب — نحدد المسارات
+BASE_PATH = "/content/drive/MyDrive/Instagram_Scraper_DB" if IN_COLAB else os.path.join(os.getcwd(), "Instagram_Scraper_DB")
+DB_PATH = os.path.join(BASE_PATH, "instagram_data.db")
+MEDIA_PATH = os.path.join(BASE_PATH, "media")
+REPORTS_PATH = os.path.join(BASE_PATH, "reports")
+STORIES_PATH = os.path.join(BASE_PATH, "stories")
+HIGHLIGHTS_PATH = os.path.join(BASE_PATH, "highlights")
+DB_BACKUP_PATH = os.path.join(BASE_PATH, "db_backups")
+
+# ============================================================
+# 4. إنشاء المجلدات والتحقق من الكتابة الفعلية على Drive
+# ============================================================
+for folder in (BASE_PATH, MEDIA_PATH, REPORTS_PATH, STORIES_PATH, HIGHLIGHTS_PATH, DB_BACKUP_PATH):
+    os.makedirs(folder, exist_ok=True)
+
+# اختبار كتابة فعلي على Drive
+def verify_drive_writable():
+    try:
+        test_file = os.path.join(BASE_PATH, f".write_test_{secrets.token_hex(4)}.tmp")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.remove(test_file)
+        print(f"✅ التحقق من الكتابة على Drive: نجح")
+        print(f"   📁 BASE_PATH = {BASE_PATH}")
+        print(f"   📁 DB_PATH   = {DB_PATH}")
+        return True
+    except Exception as e:
+        print(f"❌ فشل الكتابة على Drive: {e}")
+        return False
+
+verify_drive_writable()
+
 _http_session = requests.Session()
 _http_session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 })
 
 # ============================================================
-# 3. الحالة العالمية + المسارات
+# 5. الحالة العالمية + المسارات المؤقتة
 # ============================================================
 class AppState:
     mode = DEFAULT_MODE
@@ -64,7 +106,6 @@ class AppState:
 
 STATE = AppState()
 
-# المسار المؤقت للوسائط أثناء التشغيل
 TEMP_ROOT = tempfile.mkdtemp(prefix="ig_osint_v7_")
 TEMP_INSTADATA = os.path.join(TEMP_ROOT, "instadata")
 TEMP_MEDIA = os.path.join(TEMP_ROOT, "media")
@@ -73,10 +114,6 @@ TEMP_REPORTS = os.path.join(TEMP_ROOT, "reports")
 
 for p in (TEMP_INSTADATA, TEMP_MEDIA, TEMP_REPORTS):
     os.makedirs(p, exist_ok=True)
-
-# مسارات Google Drive الدائمة
-for folder in (BASE_PATH, MEDIA_PATH, REPORTS_PATH, STORIES_PATH, HIGHLIGHTS_PATH, DB_BACKUP_PATH):
-    os.makedirs(folder, exist_ok=True)
 
 print(f"📁 TEMP: {TEMP_ROOT}")
 print(f"📁 DB:   {DB_PATH}")
@@ -89,7 +126,7 @@ def cleanup_temp():
         print(f"⚠️ فشل حذف المجلد المؤقت: {e}")
 
 # ============================================================
-# 4. قاعدة البيانات SQLite التراكمية (من v4.0)
+# 6. قاعدة البيانات SQLite التراكمية
 # ============================================================
 def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -270,7 +307,6 @@ def init_db():
         )
     """)
 
-    # فهارس
     cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_account_taken ON posts(account_id, taken_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_followers_account ON followers(account_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_following_account ON following(account_id)")
@@ -279,7 +315,7 @@ def init_db():
 
     conn.commit()
     conn.close()
-    print("✅ قاعدة البيانات جاهزة — البيانات القديمة محفوظة.")
+    print(f"✅ قاعدة البيانات جاهزة على Drive: {DB_PATH}")
 
 def save_or_update_account(info):
     conn = db_connect()
@@ -336,7 +372,6 @@ def get_account_info(username):
     return dict(row) if row else None
 
 def post_exists(post_code):
-    """التحقق الدقيق من وجود المنشور مسبقاً — أساس منع التكرار"""
     if not post_code:
         return False
     conn = db_connect()
@@ -345,10 +380,6 @@ def post_exists(post_code):
     return row is not None
 
 def save_post_if_not_exists(account_username, media):
-    """
-    حفظ المنشور إن لم يكن موجوداً.
-    يُرجع (post_id, was_new) — was_new=False يعني موجود مسبقاً.
-    """
     username = str(account_username).lower().lstrip("@")
     code = str(media.get("shortcode") or media.get("code") or "")
     if not code:
@@ -363,10 +394,8 @@ def save_post_if_not_exists(account_username, media):
 
     account_id = account[0]
 
-    # التحقق من الوجود المسبق
     existing = cur.execute("SELECT id FROM posts WHERE post_code=?", (code,)).fetchone()
     if existing:
-        # تحديث الإحصاءات فقط (لا نُكرر التنزيل)
         cur.execute("""
             UPDATE posts SET
                 like_count=COALESCE(?, like_count),
@@ -626,7 +655,7 @@ def get_highlights(account_id):
     return result
 
 # ============================================================
-# 5. التليجرام — Rich Messages (Bot API 10.1+)
+# 7. Telegram — Rich Messages (Bot API 10.1+)
 # ============================================================
 class TelegramSender:
     @staticmethod
@@ -650,7 +679,6 @@ class TelegramSender:
 
     @staticmethod
     def send_rich_message(html_text, reply_markup=None, retries=2):
-        """Rich Message مع دعم الجداول و Details و RTL"""
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "rich_message": json.dumps({
@@ -662,7 +690,6 @@ class TelegramSender:
         }
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-
         for i in range(retries + 1):
             try:
                 r = _http_session.post(
@@ -677,8 +704,6 @@ class TelegramSender:
                     time.sleep(1.5)
                 else:
                     print(f"⚠️ Rich Message: {e}")
-
-        # fallback
         try:
             r = _http_session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -797,7 +822,7 @@ class TelegramSender:
             return False
 
 # ============================================================
-# 6. Thumbnail Engine
+# 8. Thumbnail Engine
 # ============================================================
 class ThumbnailEngine:
     _url_cache = {}
@@ -856,7 +881,7 @@ class ThumbnailEngine:
         return base64.b64encode(svg.encode()).decode()
 
 # ============================================================
-# 7. Helpers
+# 9. Helpers
 # ============================================================
 def _extract(obj, *keys, default=''):
     for k in keys:
@@ -886,7 +911,46 @@ def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 # ============================================================
-# 8. مدير instadata
+# ⭐ 10. دوال النسخ إلى Google Drive (الإصلاح الأساسي)
+# ============================================================
+def save_media_to_drive(src_path, username, subfolder="posts", new_name=None):
+    """
+    نسخ ملف وسائط من المجلد المؤقت إلى Google Drive.
+    يُرجع المسار النهائي على Drive، أو None عند الفشل.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    try:
+        # destination: /content/drive/MyDrive/Instagram_Scraper_DB/media/<username>/<subfolder>/
+        dest_dir = os.path.join(MEDIA_PATH, safe_name(username), subfolder)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        name = new_name or os.path.basename(src_path)
+        dest = os.path.join(dest_dir, name)
+
+        # إذا كان موجوداً بنفس الحجم، لا نعيد النسخ (توفير)
+        if os.path.exists(dest) and os.path.getsize(dest) == os.path.getsize(src_path):
+            return dest
+
+        shutil.copy2(src_path, dest)
+        print(f"      💾 Drive: {os.path.relpath(dest, BASE_PATH)} "
+              f"({os.path.getsize(dest)/1024:.1f} KB)")
+        return dest
+    except Exception as e:
+        print(f"      ❌ فشل النسخ إلى Drive: {e}")
+        return None
+
+def save_story_to_drive(src_path, username, new_name=None):
+    return save_media_to_drive(src_path, username, subfolder="stories", new_name=new_name)
+
+def save_highlight_to_drive(src_path, username, new_name=None):
+    return save_media_to_drive(src_path, username, subfolder="highlights", new_name=new_name)
+
+def save_profile_pic_to_drive(src_path, username):
+    return save_media_to_drive(src_path, username, subfolder="profile", new_name="profile_pic.jpg")
+
+# ============================================================
+# 11. مدير instadata
 # ============================================================
 class InstadataManager:
     _cookies_file = TEMP_COOKIES
@@ -1039,7 +1103,6 @@ class InstadataManager:
             if os.path.exists(d):
                 try:
                     shutil.rmtree(d, ignore_errors=True)
-                    print(f"   🗑️ حذف مجلد حالة: {d}")
                     removed += 1
                 except: pass
         for base in [home, "/tmp", "/var/tmp", os.path.join(home, ".cache")]:
@@ -1050,26 +1113,13 @@ class InstadataManager:
                 if os.path.exists(fp):
                     try:
                         os.remove(fp)
-                        print(f"   🗑️ حذف ملف حالة: {fp}")
                         removed += 1
                     except: pass
-        try:
-            for pattern in [os.path.join(home, "**", f"*{username}*.state.json"),
-                            os.path.join(home, "**", f"{username}_posts.state.json")]:
-                for fp in glob.glob(pattern, recursive=True):
-                    try:
-                        os.remove(fp)
-                        print(f"   🗑️ حذف: {fp}")
-                        removed += 1
-                    except: pass
-        except: pass
         if removed:
-            print(f"   ✅ تم حذف {removed} عنصر حالة")
-        else:
-            print(f"   ℹ️ لم يتم العثور على ملفات حالة عامة")
+            print(f"   ✅ تم حذف {removed} عنصر حالة قديم")
 
 # ============================================================
-# 9. محرك البحث الشامل
+# 12. محرك البحث الشامل
 # ============================================================
 class UniversalSearcher:
     def analyze_query(self, query):
@@ -1179,16 +1229,17 @@ a{color:#64b5f6}
 <div class="header"><h1>🔍 تقرير البحث</h1><div>📝 {query}</div><div>📅 {ts}</div></div>
 {''.join(sections)}
 </div></body></html>"""
+
+        # حفظ التقرير على Drive
         safe_query = safe_name(query, "search")
-        f = os.path.join(TEMP_REPORTS, f"search_{safe_query}_{datetime.now().strftime('%Y%m%d_%H%M')}.html")
+        f = os.path.join(REPORTS_PATH, f"search_{safe_query}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
         with open(f, 'w', encoding='utf-8') as fp: fp.write(html)
+        print(f"💾 تقرير البحث محفوظ على Drive: {f}")
         TelegramSender.send_document(f, f"🔍 تقرير بحث: {query}")
-        try: os.remove(f)
-        except: pass
         return True
 
 # ============================================================
-# 10. أداة السكراب الرئيسية (مع قاعدة البيانات)
+# 13. أداة السكراب الرئيسية
 # ============================================================
 class InstadataSearcher:
     def __init__(self):
@@ -1202,7 +1253,6 @@ class InstadataSearcher:
                 TelegramSender.send_message(f"⚠️ فشل جلب user_id لـ @{username}")
                 return None
 
-            # محاولة جلب معلومات إضافية من DB
             db_info = get_account_info(username)
             mode_label = "🔓 مجهول" if STATE.mode == "anonymous" else "🔐 مسجل دخول"
             uname = html_escape(username)
@@ -1222,7 +1272,6 @@ class InstadataSearcher:
 <a href="https://www.instagram.com/{uname}/">🔗 فتح الحساب</a>"""
             TelegramSender.send_rich_message(profile_html)
 
-            # حفظ معلومات الحساب في DB
             save_or_update_account({
                 "username": username, "full_name": db_info.get("full_name", "") if db_info else "",
                 "bio": db_info.get("bio", "") if db_info else "",
@@ -1276,8 +1325,8 @@ class InstadataSearcher:
                     "is_private": False, "is_verified": False,
                 })
                 account_id = get_account_id(username)
+                print(f"   ✅ سجل الحساب أُنشئ في DB: id={account_id}")
 
-            # مجلد فريد + حذف الحالة العامة + --no-resume
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             parent_dir = os.path.join(TEMP_INSTADATA, f"{username}_{ts}")
             os.makedirs(parent_dir, exist_ok=True)
@@ -1305,7 +1354,6 @@ class InstadataSearcher:
                     f"<code>{html_escape(stderr[-400:] or stdout[-400:] or '(فارغ)')}</code>")
                 return
 
-            # جمع الملفات
             all_files = []
             for root, dirs, files in os.walk(parent_dir):
                 for f in files:
@@ -1322,7 +1370,6 @@ class InstadataSearcher:
                     f"<b>stdout:</b> <code>{html_escape(stdout[-300:] or '(فارغ)')}</code>")
                 return
 
-            # قراءة metadata.jsonl
             posts_data = []
             for root, dirs, files in os.walk(parent_dir):
                 if "metadata.jsonl" in files:
@@ -1355,7 +1402,6 @@ class InstadataSearcher:
                     f"الملفات: {', '.join([os.path.basename(f) for f in all_files[:10]])}")
                 return
 
-            # ترتيب
             if order == 'asc':
                 posts_data.sort(key=lambda x: x.get('timestamp', 0) or 0)
             else:
@@ -1363,11 +1409,12 @@ class InstadataSearcher:
 
             targets = posts_data[:max_posts]
 
-            intro = f"""<b>📦 Instagram OSINT (instadata v7)</b>
+            intro = f"""<b>📦 Instagram OSINT (instadata v7.1)</b>
 👤 <b>@{html_escape(username.lstrip('@'))}</b>
 📌 <b>{len(targets)}</b> منشور
 📅 الترتيب: <b>{'الأحدث' if order == 'desc' else 'الأقدم'}</b>
-⚙️ الوضع: <b>{'🔓 مجهول' if STATE.mode == 'anonymous' else '🔐 مسجل دخول'}</b>"""
+⚙️ الوضع: <b>{'🔓 مجهول' if STATE.mode == 'anonymous' else '🔐 مسجل دخول'}</b>
+💾 الحفظ: <b>Google Drive + SQLite</b>"""
             TelegramSender.send_rich_message(intro)
 
             successful = 0
@@ -1376,7 +1423,6 @@ class InstadataSearcher:
                 code = post.get('shortcode', '?')
                 print(f"\n   📄 [{i}/{len(targets)}] {code}")
 
-                # ⭐ منع التكرار: التحقق من DB قبل التنزيل
                 if post_exists(code):
                     already_exists += 1
                     print(f"      ⏭️ موجود مسبقاً في DB — تخطي التنزيل")
@@ -1387,11 +1433,11 @@ class InstadataSearcher:
                         f"<i>هذا المنشور موجود في قاعدة البيانات — تم تخطي التنزيل.</i>")
                     continue
 
-                if self._process_post(post, username, parent_dir, index=i, total=len(targets)):
+                if self._process_post(post, username, parent_dir, account_id,
+                                      index=i, total=len(targets)):
                     successful += 1
                 InstadataManager.human_delay(0.5, 1.5)
 
-            # القصص والـ Highlights
             if fetch_stories:
                 print("\n📖 جلب القصص...")
                 self._fetch_and_process_stories(username, max_stories, account_id)
@@ -1400,7 +1446,7 @@ class InstadataSearcher:
                 print("\n📌 جلب Highlights...")
                 self._fetch_and_process_highlights(username, max_highlights, account_id)
 
-            # ⭐ إنشاء التقارير
+            # التقارير
             csv_path = self._generate_csv_report(username)
             html_path = self._generate_html_report(username, order)
 
@@ -1411,6 +1457,7 @@ class InstadataSearcher:
 ⏭️ محمل مسبقاً: <b>{already_exists}</b>
 
 <table bordered striped>
+<tr><td>💾 قاعدة البيانات</td><td>✅ {DB_PATH}</td></tr>
 <tr><td>📄 CSV</td><td>{'✅' if csv_path else '❌'}</td></tr>
 <tr><td>🌐 HTML</td><td>{'✅' if html_path else '❌'}</td></tr>
 </table>"""
@@ -1421,10 +1468,9 @@ class InstadataSearcher:
             if html_path:
                 TelegramSender.send_document(html_path, f"🌐 HTML @{username}")
 
-            # تنظيف
             try:
                 shutil.rmtree(parent_dir, ignore_errors=True)
-                print(f"   🗑️ حذف مجلد @{username}")
+                print(f"   🗑️ حذف مجلد @{username} من TEMP")
             except: pass
 
         except Exception as e:
@@ -1434,7 +1480,7 @@ class InstadataSearcher:
                 f"❌ <b>خطأ غير متوقع</b>\n"
                 f"<code>{html_escape(traceback.format_exc()[-800:])}</code>")
 
-    def _process_post(self, post, username, out_dir, index=1, total=1):
+    def _process_post(self, post, username, out_dir, account_id, index=1, total=1):
         try:
             shortcode = post.get('shortcode', '')
             if not shortcode:
@@ -1459,7 +1505,7 @@ class InstadataSearcher:
 
             print(f"      📎 {len(media_files)} ملف")
 
-            # ⭐ حفظ المنشور في DB (جديد)
+            # ⭐ حفظ في DB أولاً
             post_id, was_new = save_post_if_not_exists(username, {
                 'shortcode': shortcode,
                 'caption': post.get('caption', ''),
@@ -1470,6 +1516,18 @@ class InstadataSearcher:
                 'media_type': 'video' if media_files[0].lower().endswith(('.mp4', '.mov', '.webm')) else 'image',
                 'thumbnail_url': '',
             })
+
+            # ⭐ نسخ الوسائط إلى Google Drive
+            drive_paths = []
+            for idx, src in enumerate(media_files, 1):
+                ext = os.path.splitext(src)[1].lower()
+                new_name = f"{shortcode}" + (f"_{idx:02d}" if len(media_files) > 1 else "") + ext
+                drive_path = save_media_to_drive(src, username, subfolder="posts", new_name=new_name)
+                if drive_path:
+                    drive_paths.append(drive_path)
+
+            if not drive_paths:
+                print(f"      ❌ فشل نسخ كل الملفات إلى Drive")
 
             keyboard = TelegramSender._post_keyboard(
                 f"https://www.instagram.com/p/{shortcode}/",
@@ -1492,15 +1550,16 @@ class InstadataSearcher:
                     sent += 1
                 InstadataManager.human_delay(0.3, 0.8)
 
-            # تحديث مسار الملف في DB
-            if sent > 0 and post_id:
+            # تحديث DB بمسار Drive الفعلي
+            if post_id and drive_paths:
                 update_post_media(post_id,
-                    'video' if media_files[0].lower().endswith(('.mp4', '.mov', '.webm')) else 'image',
-                    media_files[0], '')
+                    'video' if drive_paths[0].lower().endswith(('.mp4', '.mov', '.webm')) else 'image',
+                    drive_paths[0], '')
 
             return sent > 0
         except Exception as e:
             print(f"      ⚠️ {type(e).__name__}: {str(e)[:120]}")
+            traceback.print_exc()
             return False
 
     def _post_caption_html(self, post, index, total, username):
@@ -1547,12 +1606,16 @@ class InstadataSearcher:
                     media_files.append(os.path.join(root, f))
         for i, fpath in enumerate(media_files[:max_stories], 1):
             ext = os.path.splitext(fpath)[1].lower()
+            # ⭐ نسخ إلى Drive
+            drive_path = save_story_to_drive(fpath, username,
+                                             new_name=f"story_{i:03d}{ext}")
             caption = f"📖 قصة {i} — @{username}"
             if ext in ('.mp4', '.mov', '.webm'):
                 TelegramSender.send_video(fpath, caption)
             else:
                 TelegramSender.send_photo(fpath, caption)
-            save_story(account_id, {'pk': f"story_{username}_{i}"}, fpath, "", "")
+            # حفظ في DB
+            save_story(account_id, {'pk': f"story_{username}_{i}"}, drive_path or fpath, "", "")
             InstadataManager.human_delay(0.5, 1)
         shutil.rmtree(parent_dir, ignore_errors=True)
 
@@ -1575,8 +1638,10 @@ class InstadataSearcher:
             for f in files:
                 if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mov', '.webm')):
                     media_files.append(os.path.join(root, f))
-        for fpath in media_files[:max_highlights * 5]:
+        for i, fpath in enumerate(media_files[:max_highlights * 5], 1):
             ext = os.path.splitext(fpath)[1].lower()
+            # ⭐ نسخ إلى Drive
+            save_highlight_to_drive(fpath, username, new_name=f"highlight_{i:03d}{ext}")
             caption = f"📌 Highlight — @{username}"
             if ext in ('.mp4', '.mov', '.webm'):
                 TelegramSender.send_video(fpath, caption)
@@ -1586,7 +1651,7 @@ class InstadataSearcher:
         shutil.rmtree(parent_dir, ignore_errors=True)
 
     # ========================================================
-    # ⭐ تقارير CSV و HTML
+    # تقارير CSV و HTML
     # ========================================================
     def _generate_csv_report(self, username):
         try:
@@ -1621,14 +1686,13 @@ class InstadataSearcher:
                 for row in stories:
                     writer.writerow(["story", row["story_pk"], row["story_url"], row["media_type"],
                                      "", "", "", "", row["taken_at"], username, "", "", row["file_path"] or ""])
-            print(f"📄 CSV: {path}")
+            print(f"📄 CSV على Drive: {path}")
             return path
         except Exception as exc:
             print(f"⚠️ CSV report: {exc}")
             return None
 
     def _generate_html_report(self, username, order="desc"):
-        """تقرير HTML حديث مع صور مصغرة لجميع المنشورات"""
         try:
             aid = get_account_id(username)
             if not aid:
@@ -1640,41 +1704,48 @@ class InstadataSearcher:
             stories = get_stories(aid)
             highlights = get_highlights(aid)
 
+            # صورة البروفايل
             profile_pic = ""
-            candidate = os.path.join(MEDIA_PATH, username, "profile_pic.jpg")
-            if os.path.exists(candidate):
-                profile_pic = ThumbnailEngine.from_file(candidate, 150, 50) or ""
+            for candidate_dir in ("profile", "posts"):
+                candidate = os.path.join(MEDIA_PATH, safe_name(username), candidate_dir, "profile_pic.jpg")
+                if os.path.exists(candidate):
+                    profile_pic = ThumbnailEngine.from_file(candidate, 150, 50) or ""
+                    break
 
-            # ⭐ بطاقات المنشورات مع صور مصغرة
             cards = []
             for post in posts:
-                # محاولة الصورة المصغرة من الملف المحلي أولاً
                 thumb = None
+                # أولاً: من الملف المحلي على Drive
                 if post.get("file_path") and os.path.exists(post["file_path"]):
                     thumb = ThumbnailEngine.from_file(post["file_path"], THUMB_MAX_SIZE, THUMB_QUALITY)
+                # ثانياً: من thumbnail_url
                 if not thumb:
                     thumb_url = post.get("thumbnail_url", "")
                     if thumb_url:
                         thumb = ThumbnailEngine.from_url(thumb_url, THUMB_MAX_SIZE, THUMB_QUALITY,
                                                          f"rpt_{post.get('post_code','')}")
+                # ثالثاً: من ملف الفيديو — استخراج أول frame
+                if not thumb and post.get("file_path") and os.path.exists(post["file_path"]) \
+                   and post["file_path"].lower().endswith(('.mp4', '.mov', '.webm')):
+                    thumb = self._video_thumbnail(post["file_path"])
                 if not thumb:
                     thumb = ThumbnailEngine.placeholder_svg("📷")
 
-                # التعليقات
                 comment_html = ""
                 if post.get("comments"):
                     rows = []
                     for c in post["comments"][:30]:
                         rows.append(f"<li>@{html_escape(str(c.get('commenter_username','') or ''))}: "
                                     f"{html_escape(str(c.get('comment_text','') or '')[:300])}</li>")
-                    comment_html = "<details><summary>💬 التعليقات (" + str(len(post["comments"])) + ")</summary><ul>" + "".join(rows) + "</ul></details>"
+                    comment_html = f"<details><summary>💬 التعليقات ({len(post['comments'])})</summary><ul>" + "".join(rows) + "</ul></details>"
 
                 media_badge = "🎬" if post.get("media_type") == "video" else "📷"
+                downloaded_badge = "💾" if post.get("downloaded") else ""
                 cards.append(f"""
 <article class="post-card">
   <div class="post-thumb-wrap">
     <img src="data:image/jpeg;base64,{thumb}" class="post-thumb" loading="lazy">
-    <span class="media-badge">{media_badge}</span>
+    <span class="media-badge">{media_badge}{downloaded_badge}</span>
   </div>
   <div class="post-body">
     <div class="post-meta">
@@ -1725,8 +1796,8 @@ border-radius:20px;padding:22px;margin-bottom:18px}
 display:flex;flex-direction:column;transition:transform .2s}
 .post-card:hover{transform:translateY(-3px)}
 .post-thumb-wrap{position:relative}
-.post-thumb{width:100%;height:200px;object-fit:cover;display:block}
-.media-badge{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.7);
+.post-thumb{width:100%;height:200px;object-fit:cover;display:block;background:#1e293b}
+.media-badge{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.75);
 padding:4px 8px;border-radius:8px;font-size:14px}
 .post-body{padding:14px;flex:1;display:flex;flex-direction:column;gap:8px}
 .post-meta{display:flex;gap:12px;font-size:.85rem;color:#94a3b8}
@@ -1776,21 +1847,37 @@ footer{opacity:.6;text-align:center;padding:20px;font-size:.8rem}
 <section class="section"><h2>📌 Highlights ({len(highlights)})</h2>
 {highlight_html}</section>
 
-<footer>Generated {html_escape(now_iso())} · Instagram OSINT ULTRA v7.0</footer>
+<footer>Generated {html_escape(now_iso())} · Instagram OSINT ULTRA v7.1</footer>
 </div></body></html>"""
 
             path = os.path.join(REPORTS_PATH, f"{safe_name(username)}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(html)
-            print(f"🌐 HTML report: {path}")
+            print(f"🌐 HTML على Drive: {path}")
             return path
         except Exception as exc:
             print(f"⚠️ HTML report: {exc}")
             traceback.print_exc()
             return None
 
+    def _video_thumbnail(self, video_path):
+        """استخراج صورة مصغرة من الفيديو عبر ffmpeg إن توفّر"""
+        try:
+            thumb_path = video_path + ".thumb.jpg"
+            if os.path.exists(thumb_path):
+                return ThumbnailEngine.from_file(thumb_path, THUMB_MAX_SIZE, THUMB_QUALITY)
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-ss", "00:00:01", "-i", video_path,
+                 "-vframes", "1", "-vf", "scale=300:-1", thumb_path],
+                capture_output=True, timeout=30)
+            if r.returncode == 0 and os.path.exists(thumb_path):
+                return ThumbnailEngine.from_file(thumb_path, THUMB_MAX_SIZE, THUMB_QUALITY)
+            return None
+        except Exception:
+            return None
+
 # ============================================================
-# 11. Flask App
+# 14. Flask App
 # ============================================================
 INSTAGRAM_JOB_LOCK = threading.Lock()
 app = Flask(__name__)
@@ -1798,7 +1885,7 @@ app = Flask(__name__)
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Instagram OSINT Scraper ULTRA v7.0</title>
+<title>Instagram OSINT Scraper ULTRA v7.1</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,'Segoe UI',Tahoma,Arial,sans-serif;
@@ -1843,9 +1930,16 @@ border-radius:8px;font-size:0.8rem;margin-top:8px;display:none}
 .warn.show{display:block}
 .info-box{background:#e3f2fd;border:1px solid #90caf9;color:#1565c0;padding:10px;
 border-radius:8px;font-size:0.8rem;margin-top:8px}
+.drive-info{background:#dcfce7;border:1px solid #86efac;color:#166534;padding:10px;
+border-radius:8px;font-size:0.8rem;margin-top:8px;word-break:break-all}
 </style></head><body><div class="card">
-<h1>🕵️ Instagram OSINT Scraper ULTRA v7.0</h1>
-<p class="sub">✅ instadata + SQLite + تقارير HTML/CSV + Telegram Rich Messages</p>
+<h1>🕵️ Instagram OSINT Scraper ULTRA v7.1</h1>
+<p class="sub">✅ instadata + SQLite على Drive + تقارير + Rich Messages</p>
+
+<div class="drive-info">
+💾 <b>مسار الحفظ:</b> <code>{{db_path}}</code><br>
+📂 <b>الوسائط:</b> <code>{{media_path}}</code>
+</div>
 
 <div class="mode-bar">
 <span style="font-weight:700;color:#0f3460">⚙️ وضع الوصول:</span>
@@ -1879,13 +1973,9 @@ onclick="setMode('login')">🔐 تسجيل دخول (متقدم)</button>
 <label for="fs">📖 القصص (Stories) — يتطلب تسجيل دخول</label></div>
 <div class="opt"><input type="checkbox" name="fetch_highlights" value="1" id="fh">
 <label for="fh">📌 Highlights — يتطلب تسجيل دخول</label></div>
-<div class="opt disabled"><input type="checkbox" disabled>
-<label>👥 المتابعون — غير مدعوم</label></div>
-<div class="opt disabled"><input type="checkbox" disabled>
-<label>➡️ المتابَعون — غير مدعوم</label></div>
 </div>
 <div class="info-box">
-ℹ️ <b>ملاحظة:</b> كل شيء يُرسل للتليجرام + قاعدة بيانات تراكمية على Google Drive. نتائج نظيفة في كل تشغيل.
+ℹ️ <b>ملاحظة:</b> كل شيء يُرسل للتليجرام + يُحفظ على Google Drive (DB + media + reports).
 </div>
 <div class="warn" id="loginWarn">⚠️ هذه الخيارات تتطلب تفعيل "تسجيل دخول"</div>
 <button type="submit">🚀 بدء السكراب</button>
@@ -1938,7 +2028,9 @@ def index():
     mode_label = "🔓 مجهول (عام)" if STATE.mode == "anonymous" else "🔐 مسجل دخول (متقدم)"
     return render_template_string(HTML_PAGE, mode=STATE.mode,
                                   mode_label=mode_label,
-                                  login_error=STATE.login_error)
+                                  login_error=STATE.login_error,
+                                  db_path=DB_PATH,
+                                  media_path=MEDIA_PATH)
 
 @app.route('/set_mode', methods=['POST'])
 def set_mode():
@@ -2005,7 +2097,7 @@ def start_search():
     return f"✅ جاري البحث عن: {query}", 200
 
 # ============================================================
-# 12. التشغيل
+# 15. التشغيل
 # ============================================================
 if NGROK_AUTH_TOKEN and not NGROK_AUTH_TOKEN.startswith("ضع_"):
     ngrok.set_auth_token(NGROK_AUTH_TOKEN)
@@ -2014,7 +2106,8 @@ if NGROK_AUTH_TOKEN and not NGROK_AUTH_TOKEN.startswith("ضع_"):
 print(f"📦 Engine: instadata (CLI mode)")
 print(f"🐍 Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 print(f"⚙️ الوضع الافتراضي: {STATE.mode}")
-print(f"💾 تخزين: مؤقت للوسائط + دائم لـ SQLite على Google Drive")
+print(f"💾 DB على Drive: {DB_PATH}")
+print(f"📁 Media على Drive: {MEDIA_PATH}")
 
 InstadataManager._check_python_version()
 InstadataManager._check_instadata_installed()
@@ -2030,11 +2123,10 @@ print(f"🌐 {url}")
 print("="*60)
 print("✨ الميزات:")
 print("   🔓 وضع مجهول + 🔐 تسجيل دخول (تبديل من الواجهة)")
-print("   📖 القصص + 📌 Highlights (تتطلب login)")
-print("   📤 كل شيء يُرسل للتليجرام مباشرة")
-print("   💾 قاعدة بيانات SQLite تراكمية على Google Drive")
-print("   🎯 منع تكرار دقيق: لا تُنزّل ما هو موجود مسبقاً")
-print("   📄 تقارير CSV + HTML مع صور مصغرة")
+print("   💾 SQLite تراكمية على Google Drive (نفس المسار السابق)")
+print("   🎯 منع تكرار دقيق + إشعار 'محمل مسبقاً'")
+print("   📄 تقارير CSV + HTML مع صور مصغرة محفوظة على Drive")
+print("   📁 نسخ تلقائي للوسائط إلى Drive/media/<username>/")
 print("   🎨 Telegram Rich Messages (جداول + Details + RTL)")
 print("="*60)
 
