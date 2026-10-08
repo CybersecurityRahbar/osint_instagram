@@ -97,7 +97,6 @@ Do not delete the existing Drive session before testing. First restart/clean the
 ```python
 !pip install -q --force-reinstall instagrapi==3.0.20
 ```
-
 ### Validation note
 - The repository now contains no external requirements file for this workflow.
 - The main tool remains a single-file/single-cell implementation.
@@ -197,8 +196,7 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Instagram media downloads are now sequential rather than concurrent.
 - Existing database post rows can now be reprocessed, so a previous failed download can be retried and completed later.
 - Post delivery to Telegram is numbered `#01 / N`, includes metadata, an Instagram link button, and uses HTML captions with caption-above-media.
-- Profile cards now use `user_info_by_username()` directly, include profile photo plus public account statistics, verification/privacy/account type/category/external URL when available, and are sent as modern Telegram content.
-- The tool now supports Telegram Rich Messages through Bot API `sendRichMessage`, with an HTML fallback to `sendMessage`.
+- Profile cards now use `user_info_by_username()` directly, include profile photo plus public account statistics, verification/privacy/account type/category/external URL when available, and are sent as modern Telegram content.- The tool now supports Telegram Rich Messages through Bot API `sendRichMessage`, with an HTML fallback to `sendMessage`.
 - Telegram media messages use the current `show_caption_above_media` option and inline URL buttons.
 - 429 handling is now a separate throttle state. A 429 does not clear the client, does not mark the session as logged out, and causes the current task to stop safely until the cooldown expires.
 - Session validation is cached for 10 minutes and is skipped during an active 429 cooldown.
@@ -297,8 +295,7 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Static source review completed for login strategy, private v1 story/follower/highlight paths, native story/media download, view/play metrics, follower DB migration, and legacy-session isolation.
 - Live authentication/data collection still requires testing by the user in Colab with an authorized account after the account-security warning is fully resolved.
 
-### Final hardening in this iteration
-- The legacy strategy uses a new session filename `ig_tool_session_legacy_v3.json` so the next test does not reuse the browser-cloned session file that caused the account security incident.
+### Final hardening in this iteration- The legacy strategy uses a new session filename `ig_tool_session_legacy_v3.json` so the next test does not reuse the browser-cloned session file that caused the account security incident.
 - `login_legacy()` is given `private_transport="requests"` consistently for both initial and saved-session clients.
 - Optional 2FA/TOTP/SMS/backup-code entry is handled through `getpass()` when instagrapi raises `TwoFactorRequired`; no codes are stored in GitHub.
 - Instagram jobs are serialized with a process-wide lock so simultaneous `/start` and `/search` requests cannot create bursts against one authenticated session.
@@ -398,7 +395,6 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - HTML report يشمل profile/stories/highlights/followers/following/posts.
 - Following وHighlights أصبحت لها جداول تخزين تراكمية.
 - بيانات المنشور الموجود في SQLite يتم تحديث إحصاءاته عند إعادة العثور عليه بدلاً من تجاهله تماماً.
-
 ### قاعدة البيانات
 - نفس `instagram_data.db` السابق ما زال مستخدماً.
 - تمت إضافة أعمدة profile إضافية إلى `accounts` بطريقة ALTER TABLE فقط.
@@ -498,7 +494,6 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Real passwords/tokens are intentionally not committed to the public GitHub repository. They remain runtime/Colab variables. The old exposed credentials must be rotated because Git history may still contain them.
 - The ngrok startup path now explicitly requests `https://yin-spender-percent.ngrok-free.dev` and does not fall back to a random URL. If the domain is not available to the authenticated ngrok account, startup fails loudly instead of producing a different address.
 - Current ngrok documentation describes account development domains and fixed/custom endpoint URLs; exact availability of this specific domain can only be confirmed from the user's ngrok account at runtime.
-
 ## 2026-10-06 — Runtime proof: verification callback was not reaching Login
 
 ### User runtime evidence
@@ -566,3 +561,127 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - The server enters `waiting_code`.
 - Manual status refresh shows `waiting_code` and enables the Send Code button.
 - The user can paste the received code and submit it.
+
+## 2026-10-08 — Research audit: free Instagram libraries/tools that support anonymous public-data collection
+
+### User question
+- The user asked whether the previously listed Instagram libraries/tools are the only free options that can collect Instagram data without logging in.
+
+### Current research conclusion
+- No. The previous list is not exhaustive.
+- The important distinction is between:
+  1. a project being free/open-source;
+  2. supporting anonymous/guest requests;
+  3. which specific data types work without login.
+- As of 2026-10-08, anonymous access is mainly practical for public profiles/posts/reels and similar public data. Features such as Stories, followers/following, feed, private-account data and some comments commonly require authentication or may be blocked/rate-limited.
+- Anonymous access can change or fail because Instagram changes web endpoints and anti-abuse controls. Therefore "no login supported" must not be interpreted as "guaranteed unlimited anonymous access".
+
+### Additional real projects found
+
+#### Instaloader
+- Free/open-source Python project.
+- Supports public profile access without login.
+- Login is needed for private profiles and several richer operations; the official documentation explicitly marks comments as requiring login and Stories as authentication-dependent.
+- Suitable as a stable baseline for public-profile/post downloading rather than a full anonymous Instagram API.
+- Current project/source was verified during the 2026-10-08 research pass.
+
+#### Ensta
+- Current GitHub project: diezo/Ensta.
+- MIT licensed.
+- Explicitly supports both authenticated and anonymous requests.
+- It has a Guest class that does not require login but is intentionally limited; the Mobile class requires authentication and exposes the broader feature set.
+- Guest mode is therefore a genuine no-login option for public data, but not a replacement for the authenticated API.
+
+#### H4X-Tools
+- Current GitHub project with GPL-3.0 license.
+- Its Instagram scraper has a two-track design:
+  - Guest mode: no login, using Ensta Guest for public profile data and recent posts.
+  - Authenticated mode: richer data including features such as Stories, Highlights and Reels.
+- This is a real no-login OSINT tool, but the anonymous branch is intentionally narrower than the authenticated branch.
+
+#### CB-InstaHunter
+- Current GitHub project, MIT licensed.
+- Explicitly advertises public Instagram-profile OSINT without an account/login and without an API key.
+- Useful for profile information, public posts, engagement analysis and related OSINT workflows.
+- Small project/activity footprint compared with Instaloader, so treat its endpoint techniques as more fragile.
+
+#### instagram-graphql-scraper (FaustRen)
+- Current GitHub project, MIT licensed.
+- Explicitly states that without logging in it works for any public profile and this is the default/recommended mode.
+- Captures the browser GraphQL request and replays pagination through requests.
+- Best suited to collecting public profile posts; it is not a general full Instagram data API.
+- Requires Selenium/Selenium Wire and a browser-driver setup.
+
+#### gallery-dl
+- Free/open-source downloader.
+- Instagram support is available and authentication is optional in the extractor configuration.
+- Best understood as a media/gallery downloader, not as a complete structured Instagram OSINT API.
+- Useful when the main goal is downloading public media rather than collecting all metadata fields.
+
+#### insta-fetch
+- Current GitHub project, MIT licensed.
+- It supports profile/posts/reels/hashtag operations without an API key; authentication is required for some richer capabilities such as Stories and follower/following lists.
+- Therefore it qualifies as a partial no-login tool, not as a complete anonymous replacement.
+
+#### instagram-api (faizahmaddae/insta-api)
+- Current GitHub project, MIT licensed.
+- Its documentation explicitly states that Profile Info and Profile Posts work without login; Stories, Followers/Following, Feed and direct post-by-shortcode require authentication; Search is available without login but limited.
+- This is another useful example of a mixed anonymous/authenticated architecture.
+
+#### instagram-scraper (omkarcloud)
+- Current GitHub project, MIT licensed.
+- The repository currently presents a local open-source scraper with 19 live endpoints covering profiles, posts, reels, comments, stories, highlights, similar users, hashtags, locations, audio and trending data, with no API key or proxy required for the local setup.
+- The project's README claims broad anonymous coverage, but the repository is currently very small (3 commits, 3 stars). Treat the broad feature claims as project claims that still need live validation against today's Instagram responses before adopting it for the production tool.
+
+#### 2scraper/instagram-scraper
+- Current GitHub topic listing, updated 2026-10-05.
+- Its current description explicitly advertises public profiles, posts and Reels readable while logged out, with Playwright/Selenium/Puppeteer options plus JSON/CSV and incremental monitoring.
+- The repository itself was not reliably accessible in this research pass, so license/free-status should be checked directly before integrating it.
+- Keep it on the candidate list, but do not classify it as a confirmed free/open-source dependency until its repository license is verified.
+
+### Tools from the previous user-supplied list that need correction
+
+#### igmapper
+- No credible current Instagram-specific open-source project matching the supplied description was found in the research pass.
+- Do not treat it as a verified library until an exact repository/package source is provided.
+
+#### insta-sophia-sdk
+- No credible current Instagram SDK matching the supplied description (including the claimed Moneto/Nornir keys) was found.
+- Do not treat this entry as verified; it appears to be a wrong name, misidentification or unsupported description.
+
+#### Instagram & TikTok Scraper (95+ languages / ffmpeg description)
+- Several similarly named repositories exist, but the exact project and feature set in the supplied table could not be verified from a reliable current source.
+- Keep it unverified until its exact repository/package URL is identified.
+
+#### instagram-monitor
+- The name is ambiguous because multiple unrelated projects use it.
+- One current project requires an Instagram account/login to monitor another account.
+- Another current project (misiektoja/instagram_monitor) supports runs without login for some monitoring, while follower lists require a logged-in session and anonymous rate limits can be strict.
+- Therefore the blanket claim "instagram-monitor works without login" is incorrect without specifying the exact repository.
+
+#### InstaLoader
+- The verified project name is Instaloader, not "InstaLoader".
+- Instaloader should be evaluated as the actual library/tool.
+
+### Current practical ranking for this project
+- Best no-login baseline for public profile/posts: Instaloader.
+- Best lightweight Python library with a genuine Guest API: Ensta Guest.
+- Best current browser/GraphQL public-post collector: FaustRen/instagram-graphql-scraper.
+- Best no-login OSINT-style profile tool: CB-InstaHunter.
+- Best broader OSINT wrapper with both guest and authenticated modes: H4X-Tools.
+- Best media downloader when structured data is secondary: gallery-dl.
+- Most interesting broad local API candidate for experimentation: omkarcloud/instagram-scraper, but it needs live validation because its repository is very small.
+- Current project dependency already tested by this project: instaharvest-v2 1.1.88. It remains the selected Anonymous foundation because the user actually verified that its public.get_posts path works in Colab without login.
+
+### Important engineering implication for our repository
+- The project should not try to replace its working Anonymous instaharvest-v2 path merely because another library claims more anonymous endpoints.
+- Instead, new candidates should be benchmarked against the exact data requirements:
+  profile metadata, public posts, reels, comments, hashtags/search, media URLs/download, stories, highlights, followers, following, pagination, rate-limit behavior and Colab compatibility.
+- A candidate that claims anonymous Stories/followers/following should be treated skeptically until live-tested, because these are commonly authentication-gated or challenge-prone.
+
+### Sources checked
+- Current GitHub repositories and/or current project documentation for Instaloader, Ensta, H4X-Tools, CB-InstaHunter, FaustRen/instagram-graphql-scraper, insta-fetch, gallery-dl and related projects.
+- Current GitHub source for faizahmaddae/insta-api.
+- Current GitHub source for omkarcloud/instagram-scraper.
+- Current GitHub topic listing for 2scraper/instagram-scraper.
+- Current project history in this repository continues to be cumulative; no previous context entries were removed.
