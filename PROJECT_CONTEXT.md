@@ -685,3 +685,52 @@ Do not delete the existing Drive session before testing. First restart/clean the
 - Current GitHub source for omkarcloud/instagram-scraper.
 - Current GitHub topic listing for 2scraper/instagram-scraper.
 - Current project history in this repository continues to be cumulative; no previous context entries were removed.
+## 2026-10-10 — Initial line-by-line audit of `osintfacebook.py` (no code changes)
+
+### Scope and baseline
+- User asked for a careful source review before changing behavior, focusing on accurate Facebook search, opening the intended Page/profile, and collecting its posts in Google Colab.
+- Audited `osintfacebook.py` from the `CybersecurityRahbar/osint_instagram` repository.
+- Source blob SHA at audit time: `77ac6d87493268ce7f2da51dd7ea42d736acede7`.
+- This pass is analysis only; the scraper source was not modified.
+
+### Current architecture observed
+- Runs inside Google Colab and mounts Google Drive.
+- Uses Playwright/Chromium for Facebook UI navigation, an Xvfb + x11vnc + noVNC viewer exposed through ngrok for manual intervention, and Telegram for status/screenshots/results.
+- Saves Playwright storage state to `/content/drive/MyDrive/FB_Sessions/fb_session.json`.
+- Searches a keyword, opens one selected result, listens for `/api/graphql/` responses while scrolling, recursively extracts candidate post objects, normalizes a subset of fields, and sends data/media to Telegram plus CSV/HTML reports.
+
+### Main findings — search and target selection
+1. `search_user()` always visits `/search/people/?q=...`. It therefore searches people, not Facebook Pages, when the intended target is a Page.
+2. The result selector list is broad (`a[href*='facebook.com/'...]`) and accepts the first matching profile-like URL. It does not rank or disambiguate candidates by exact visible name, page type, category, or stable numeric Page/profile ID.
+3. The URL matcher mainly recognizes `profile.php?id=...` or a single username-like path. It does not correctly model common Page URL shapes such as `/pages/<name>/<id>`, nor does it distinguish a person profile from a Page.
+4. `run()` immediately opens the first selected URL; it does not check that the destination's displayed name/identity actually matches the requested target.
+
+### Main findings — session and remote-control safety
+1. `VNCViewer.start()` starts `x11vnc` with `-nopw` and publishes the noVNC endpoint through a public ngrok tunnel. Anyone who obtains that public URL may be able to interact with the remote browser and the signed-in Facebook session. This is a high-priority exposure; the remote viewer should not be publicly reachable without proper access control, and the URL must be treated as a secret.
+2. `snap()` defaults to `send=True`. The login path calls it after filling the email and again after filling the password, so screenshots of sensitive login states are sent to Telegram by default. Sensitive-state screenshots should never be sent; use non-sending diagnostics and avoid recording credentials.
+3. `_load_session()` and `_save_session()` treat presence of the `c_user` cookie as the principal success signal. Cookie presence alone does not prove the session is still authenticated or that the requested profile can be opened; verify a clearly authenticated page state and handle redirects/challenges.
+4. Runtime secrets are currently represented by blank constants, which is preferable to committing real credentials. Keep actual Facebook, Telegram, and ngrok credentials out of source control and rotate any values that were previously exposed.
+
+### Main findings — post collection and data quality
+1. `collect()` listens to every response whose URL contains `/api/graphql/`, then attempts JSON parsing without narrowing to known post-related responses. This is fragile because Facebook's internal response shapes and fields can change.
+2. The full accumulated `graphql_responses` list is re-walked on every scroll iteration. That repeatedly processes the same large payloads and can become increasingly slow; track newly received responses or newly identified post IDs instead.
+3. The listener starts only when `collect()` begins, after profile navigation. Posts already loaded before the listener attaches are not captured unless a later UI action triggers another response.
+4. `_extract_posts()` uses a heuristic requiring `creation_time` and one of `message/story/attachments`. It can miss valid posts whose structure differs, and can match nested objects that are not top-level posts.
+5. `_normalize()` builds a permalink as `https://www.facebook.com/{post_id}`. Raw GraphQL IDs are not guaranteed to be valid post permalinks; prefer an actual canonical permalink or URL field observed in the returned post object, and flag records with no verified permalink.
+6. Media URLs are downloaded with a separate global `requests.Session`, not the Playwright browser context/cookies. Authenticated or short-lived CDN URLs may fail. The code currently focuses on image-like attachment URIs and does not reliably model video/media types.
+7. The collector currently records post text, timestamp, reaction/comment/share counts, reaction breakdown and a limited list of media URLs. It does not collect comment text; the current comment field is a count.
+8. `datetime.fromtimestamp()` uses the runtime's local timezone, so timestamps may be shifted/ambiguous rather than explicitly UTC or source-local.
+9. Profile counts are extracted from body text with regular expressions. Abbreviated values such as `1.2K` can be parsed incorrectly (e.g. digits may collapse to `12`), and the result varies with language/layout.
+10. The HTML report labels the fallback SVG image as `image/jpeg`; that MIME declaration does not match the embedded SVG. Telegram HTML message chunking may also split tags/entities for long messages.
+
+### Recommended repair sequence
+1. **Safety first:** stop sending login-state screenshots to Telegram; secure or disable the public noVNC endpoint before using an authenticated account.
+2. **Define target type explicitly:** person profile vs Facebook Page. Use an appropriate search flow for each rather than a single people-search route.
+3. **Make target selection deterministic:** return several candidates with visible name, URL, and any available identity/type signals; do not silently choose the first generic anchor. Validate the opened page against the selected candidate.
+4. **Add focused diagnostics:** record the final search URL, result count, candidate URLs/names, selected identity, final opened URL, and why the target was accepted/rejected. Keep diagnostics free of credentials and session cookies.
+5. **Harden collection incrementally:** process each GraphQL response once, preserve verified canonical post URLs, deduplicate by stable post ID, track scroll/pagination exhaustion, and report which requested fields were actually observed rather than assuming every field exists.
+6. **Validate on a small, authorized/public target first:** compare collected items with posts visibly available to the signed-in account, record missed/duplicate posts and selector/response-shape evidence, then change one stage at a time.
+
+### Next-session starting point
+- Do not replace the full script yet. First determine whether the intended targets are Pages, personal profiles, or both, then repair target discovery/selection and validation before changing the GraphQL normalization.
+- No live Facebook account or Colab runtime was available during this source-only audit, so live behavior remains unverified.
